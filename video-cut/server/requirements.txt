@@ -1,0 +1,8 @@
+Flask==3.0.3
+Flask-Cors==5.0.0
+Flask-SQLAlchemy==3.1.1
+SQLAlchemy==2.0.36
+# Use a widely available recent release
+yt-dlp>=2024.10.7,<2026.0.0
+Werkzeug==3.0.6
+

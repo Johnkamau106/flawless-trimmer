@@ -102,8 +102,8 @@ function App() {
             <QualitySelect formats={formats} selected={quality} onChange={setQuality} />
           ) : null}
 
-          {duration ? (
-            <RangeSelector duration={duration} start={range.start} end={range.end} onChange={setRange} />
+          {typeof meta?.duration === 'number' ? (
+            <RangeSelector duration={meta.duration} start={range.start} end={range.end} onChange={setRange} />
           ) : null}
 
           <div className="actions card">

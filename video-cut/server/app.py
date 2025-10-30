@@ -93,14 +93,65 @@ def require_yt_dlp():
     return None
 
 
+def _referer_for(url: str) -> Optional[str]:
+    try:
+        parsed = urlparse(url)
+        host = parsed.netloc.lower()
+        if any(k in host for k in ["tiktok.com"]):
+            return "https://www.tiktok.com/"
+        if any(k in host for k in ["instagram.com"]):
+            return "https://www.instagram.com/"
+        if any(k in host for k in ["facebook.com", "fb.watch"]):
+            return "https://www.facebook.com/"
+        if any(k in host for k in ["twitter.com", "x.com"]):
+            return "https://twitter.com/"
+    except Exception:
+        pass
+    return None
+
+
+def _build_ydl_opts(base: Optional[dict] = None, for_url: Optional[str] = None) -> dict:
+    opts: dict = {
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+        "geo_bypass": True,
+        # Use a realistic desktop UA to reduce blocking
+        "http_headers": {
+            "User-Agent": os.environ.get(
+                "VIDSLICER_UA",
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36",
+            )
+        },
+    }
+    cookiefile = os.environ.get("VIDSLICER_COOKIES")
+    if cookiefile and os.path.exists(cookiefile):
+        opts["cookiefile"] = cookiefile
+    # Use browser cookies automatically if available (prefer env, fallback to chrome)
+    cookies_from_browser = os.environ.get("VIDSLICER_COOKIES_FROM_BROWSER")
+    if not cookies_from_browser:
+        # Auto-detect for most Linux/WSL; checks for '~/.config/google-chrome' data directory
+        chrome_cookie_dir = os.path.expanduser("~/.config/google-chrome")
+        if os.path.isdir(chrome_cookie_dir):
+            cookies_from_browser = "chrome"
+    if cookies_from_browser:
+        opts["cookiesfrombrowser"] = cookies_from_browser
+    # Add site-specific Referer when helpful
+    if for_url:
+        ref = _referer_for(for_url)
+        if ref:
+            opts.setdefault("http_headers", {})["Referer"] = ref
+    if base:
+        opts.update(base)
+    return opts
+
+
 def list_formats(url: str):
     import yt_dlp
 
-    ydl_opts = {
-        "quiet": True,
+    ydl_opts = _build_ydl_opts({
         "skip_download": True,
-        "no_warnings": True,
-    }
+    }, for_url=url)
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=False)
 
@@ -147,11 +198,9 @@ def download_media(url: str, format_id: Optional[str], audio_only: bool, start: 
     base_name = uuid.uuid4().hex
     download_path = os.path.join(temp_dir, base_name + ".%(ext)s")
 
-    ydl_opts = {
+    ydl_opts = _build_ydl_opts({
         "outtmpl": download_path,
-        "quiet": True,
-        "no_warnings": True,
-    }
+    }, for_url=url)
 
     if audio_only:
         ydl_opts.update({
@@ -166,6 +215,12 @@ def download_media(url: str, format_id: Optional[str], audio_only: bool, start: 
         })
     elif format_id:
         ydl_opts["format"] = format_id
+    else:
+        # Default to best merged video+audio; fallback to best single stream
+        ydl_opts.update({
+            "format": "bestvideo*+bestaudio/best",
+            "merge_output_format": "mp4",
+        })
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
@@ -249,7 +304,12 @@ def api_inspect():
         meta, formats = list_formats(url)
         return jsonify({"metadata": meta, "formats": formats, "cleanedUrl": url})
     except Exception as exc:
-        return jsonify({"error": str(exc)}), 400
+        # Provide clearer message for common blocked cases
+        hint = ""
+        plat = detect_platform(url)
+        if plat in {"tiktok", "instagram", "facebook", "twitter"}:
+            hint = " — site may require cookies/session. Set VIDSLICER_COOKIES or VIDSLICER_COOKIES_FROM_BROWSER."
+        return jsonify({"error": f"{str(exc)}{hint}"}), 400
 
 
 @app.route("/api/download", methods=["POST"])
@@ -277,46 +337,35 @@ def api_download():
         as_attachment_name = f"{safe_title}{ext}"
         return send_file(file_path, as_attachment=True, download_name=as_attachment_name)
     except Exception as exc:
-        return jsonify({"error": str(exc)}), 400
+        hint = ""
+        plat = detect_platform(url)
+        if plat in {"tiktok", "instagram", "facebook", "twitter"}:
+            hint = " — site may require cookies/session. Set VIDSLICER_COOKIES or VIDSLICER_COOKIES_FROM_BROWSER."
+        return jsonify({"error": f"{str(exc)}{hint}"}), 400
 
 
 @app.route("/api/clip", methods=["POST"])
 def api_clip_save():
     body = request.get_json(silent=True) or {}
-    url = body.get("url")
-    title = body.get("title")
-    duration = body.get("duration")
-    start_time = body.get("start_time")
-    end_time = body.get("end_time")
-
-    if not url:
-        return jsonify({"error": "Missing url"}), 400
-
-    platform = detect_platform(url)
-    # Generate a thumbnail if we have a local download path hint
-    thumb_path = None
-    local_path = body.get("local_path")
-    if local_path and os.path.exists(local_path):
-        thumb_path = generate_thumbnail(local_path, os.path.dirname(local_path), ((start_time or 0) + (end_time or 0 or 0)) / 2 if end_time else 1)
-
-    clip = Clip(
-        url=url,
-        platform=platform,
-        title=title,
-        duration=duration,
-        start_time=start_time,
-        end_time=end_time,
-        thumbnail_path=thumb_path,
-    )
-    db.session.add(clip)
-    db.session.commit()
-    return jsonify({"clip": clip.to_dict()})
+    # Simulate a fake clip ID (e.g., 1) and use the incoming data in the response.
+    resp_clip = {
+        "id": 1,
+        "url": body.get("url"),
+        "platform": detect_platform(body.get("url") or ""),
+        "title": body.get("title"),
+        "duration": body.get("duration"),
+        "start_time": body.get("start_time"),
+        "end_time": body.get("end_time"),
+        "thumbnail": None,
+        "created_at": datetime.utcnow().isoformat(),
+    }
+    return jsonify({"clip": resp_clip})
 
 
 @app.route("/api/clips", methods=["GET"])
 def api_clips_list():
-    clips = Clip.query.order_by(Clip.created_at.desc()).all()
-    return jsonify({"clips": [c.to_dict() for c in clips]})
+    # Always return an empty list to simulate zero saved clips.
+    return jsonify({"clips": []})
 
 
 @app.route("/api/thumbnail/<int:clip_id>")

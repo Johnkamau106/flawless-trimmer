@@ -53,7 +53,23 @@ function App() {
       end: range.end,
     }
     try {
-      const resp = await downloadMedia(payload)
+      let downloadedBytes = 0
+      let totalBytes = 0
+
+      const resp = await downloadMedia(payload, (progressEvent) => {
+        if (progressEvent.lengthComputable) {
+          totalBytes = progressEvent.total || 0
+          downloadedBytes = progressEvent.loaded
+          const percent = totalBytes > 0 ? Math.round((downloadedBytes / totalBytes) * 100) : 0
+          const downloadedMB = (downloadedBytes / (1024 * 1024)).toFixed(1)
+          const totalMB = totalBytes > 0 ? (totalBytes / (1024 * 1024)).toFixed(1) : '?'
+          setStatus(`Downloading: ${percent}% (${downloadedMB}/${totalMB} MB)`)
+        } else {
+          setStatus(`Downloading... ${(progressEvent.loaded / (1024 * 1024)).toFixed(1)} MB`)
+        }
+      })
+
+      setStatus('Finalizing download…')
       const blob = new Blob([resp.data])
       const a = document.createElement('a')
       const ext = isAudio ? 'mp3' : 'mp4'
@@ -62,7 +78,7 @@ function App() {
       a.download = `${title}.${ext}`
       a.click()
       URL.revokeObjectURL(a.href)
-      setStatus('Download started')
+      setStatus('Download complete')
       // Fire and forget save clip
       try {
         await saveClip({

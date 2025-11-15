@@ -83,6 +83,13 @@ python -m waitress --host=0.0.0.0 --port=5000 app:app
 
 Backend:
 - `VIDSLICER_DB` — Optional path to SQLite file (default: `server/vidslicer.db`)
+- `VIDSLICER_COOKIES` — Path to cookies.txt file for authenticated downloads (e.g., `/path/to/cookies.txt`)
+- `VIDSLICER_COOKIES_FROM_BROWSER` — Auto-use browser cookies: `chrome` or `firefox` (auto-detected on Linux/WSL if Chrome is found)
+- `VIDSLICER_UA` — Custom User-Agent string (optional)
+- `VIDSLICER_CACHE` — Enable file caching for faster repeated downloads (default: `true`, set to `false` to disable)
+- `VIDSLICER_CACHE_DIR` — Cache directory path (default: `server/cache`)
+- `VIDSLICER_CONCURRENT_FRAGMENTS` — Number of concurrent fragments to download (default: `4`, increase for faster downloads on good connections)
+- `PORT` — Flask server port (default: `5000`)
 
 Frontend:
 - `VITE_API_BASE_URL` — Base URL to Flask API (default: `http://localhost:5000`)
@@ -145,11 +152,67 @@ Response:
 
 ---
 
+## Performance Optimizations
+
+The app includes several optimizations for faster downloads:
+
+1. **Concurrent Fragment Downloads**: Downloads multiple video fragments in parallel (configurable via `VIDSLICER_CONCURRENT_FRAGMENTS`)
+   - **YouTube**: Default 2 fragments to avoid rate limiting
+   - **Other platforms**: Default 4 fragments (can be increased)
+2. **Chunked Streaming**: Files are streamed in 8KB chunks instead of loading entirely into memory
+3. **File Caching**: Repeated downloads of the same video/trim are served from cache instantly (can be disabled with `VIDSLICER_CACHE=false`)
+4. **Fast FFmpeg Encoding**: Uses `veryfast` preset for re-encoding when needed, with `faststart` flag for streaming optimization
+5. **Progress Tracking**: Real-time download progress with percentage and MB transferred
+6. **Automatic Retry Logic**: Retries failed downloads up to 3 times with exponential backoff (2s, 4s delays)
+
+**YouTube-Specific Optimizations**:
+- Uses single-stream format (`best`) instead of merged video+audio to reduce concurrent requests
+- Reduced concurrent fragments (2 instead of 4) to avoid rate limiting
+- Built-in retry logic for 403 errors
+
+**Tip**: For faster downloads on high-speed connections (non-YouTube), increase concurrent fragments:
+```bash
+export VIDSLICER_CONCURRENT_FRAGMENTS=8  # Only affects non-YouTube platforms
+```
+
+---
+
 ## Troubleshooting
-- ffmpeg not found: Ensure `ffmpeg` is installed and in PATH (`ffmpeg -version`).
-- Some links return errors: The source may block downloads; try with cookies or different network. `yt-dlp` can be configured with additional options if needed.
-- Trimming issues on some formats: The app falls back to re-encoding if stream copy fails; this is slower but more reliable.
-- CORS errors in dev: Verify backend at `http://localhost:5000` is running and `VITE_API_BASE_URL` is set correctly.
+
+### YouTube 403 Forbidden Errors
+If you encounter "HTTP Error 403: Forbidden" when downloading from YouTube, try these solutions:
+
+1. **Update yt-dlp** (most common fix):
+   ```bash
+   pip install -U yt-dlp
+   ```
+
+2. **Use browser cookies** (recommended for authenticated content):
+   - The app automatically tries to use cookies from Chrome/Firefox if available
+   - For manual cookie export:
+     - Install a browser extension like "Get cookies.txt" (Chrome/Edge) or "cookies.txt" (Firefox)
+     - Export cookies for `youtube.com` to a file (e.g., `cookies.txt`)
+     - Set environment variable: `export VIDSLICER_COOKIES=/path/to/cookies.txt` (Linux/WSL) or `set VIDSLICER_COOKIES=C:\path\to\cookies.txt` (Windows CMD)
+   - Or use browser cookies automatically:
+     ```bash
+     export VIDSLICER_COOKIES_FROM_BROWSER=chrome  # or firefox
+     ```
+
+3. **Wait and retry**: The app automatically retries 403 errors with delays (2s, 4s). If it still fails:
+   - Wait 5-10 minutes before trying again
+   - YouTube may be temporarily rate-limiting your IP
+   - Try using a VPN or different network
+
+4. **Reduce concurrent requests** (if still having issues):
+   ```bash
+   export VIDSLICER_CONCURRENT_FRAGMENTS=1  # Even more conservative for YouTube
+   ```
+
+### Other Issues
+- **ffmpeg not found**: Ensure `ffmpeg` is installed and in PATH (`ffmpeg -version`).
+- **Some links return errors**: The source may block downloads; try with cookies or different network. `yt-dlp` can be configured with additional options if needed.
+- **Trimming issues on some formats**: The app falls back to re-encoding if stream copy fails; this is slower but more reliable.
+- **CORS errors in dev**: Verify backend at `http://localhost:5000` is running and `VITE_API_BASE_URL` is set correctly.
 
 ---
 

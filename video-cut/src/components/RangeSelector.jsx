@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 
 export default function RangeSelector({ duration, start, end, onChange }) {
     const [localStart, setLocalStart] = useState(start ?? 0)
@@ -41,31 +41,52 @@ export default function RangeSelector({ duration, start, end, onChange }) {
 
     const fullSelected = duration && Math.abs((localEnd ?? 0) - (localStart ?? 0) - duration) < 0.001
 
+    const positions = useMemo(() => {
+        const d = duration || 0
+        const s = d ? (localStart / d) * 100 : 0
+        const e = d ? (localEnd / d) * 100 : 0
+        return { s, e }
+    }, [localStart, localEnd, duration])
+
     return (
         <div className="range-selector card">
-            <div className="row">
-                <div className="col">
-                    <label className="label">Start</label>
-                    <input type="number" min="0" max={duration || 0} step="1" className="input"
-                        value={Math.floor(localStart)} onChange={(e) => onStartChange(e.target.value)} />
-                    <div className="hint">{format(localStart)}</div>
-                </div>
-                <div className="col">
-                    <label className="label">End</label>
-                    <input type="number" min="0" max={duration || 0} step="1" className="input"
-                        value={Math.floor(localEnd)} onChange={(e) => onEndChange(e.target.value)} />
-                    <div className="hint">{format(localEnd)}</div>
-                </div>
+            <div className="range-track">
+                <div className="range-line" />
+                {duration ? (
+                    <>
+                        {/* Underlay showing selected segment */}
+                        <div
+                            className="range-selected"
+                            style={{ left: `${positions.s}%`, width: `${Math.max(positions.e - positions.s, 0)}%` }}
+                        />
+                        {/* Two inputs overlaid to act like two handles on one line */}
+                        <input
+                            aria-label="Start"
+                            className="range-input"
+                            type="range"
+                            min="0"
+                            max={duration}
+                            step="1"
+                            value={localStart}
+                            onChange={(e) => onStartChange(e.target.value)}
+                        />
+                        <input
+                            aria-label="End"
+                            className="range-input"
+                            type="range"
+                            min="0"
+                            max={duration}
+                            step="1"
+                            value={localEnd}
+                            onChange={(e) => onEndChange(e.target.value)}
+                        />
+                        {/* Time labels positioned above the line */}
+                        <div className="range-label start" style={{ left: `${positions.s}%` }}>{format(localStart)}</div>
+                        <div className="range-label end" style={{ left: `${positions.e}%` }}>{format(localEnd)}</div>
+                    </>
+                ) : null}
             </div>
             {fullSelected && <div className="tag">Full video selected</div>}
-            {duration ? (
-                <input type="range" min="0" max={duration} step="1" value={localStart}
-                    onChange={(e) => onStartChange(e.target.value)} />
-            ) : null}
-            {duration ? (
-                <input type="range" min="0" max={duration} step="1" value={localEnd}
-                    onChange={(e) => onEndChange(e.target.value)} />
-            ) : null}
         </div>
     )
 }

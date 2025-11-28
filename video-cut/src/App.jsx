@@ -4,7 +4,6 @@ import UrlInput from './components/UrlInput.jsx'
 import Player from './components/Player.jsx'
 import QualitySelect from './components/QualitySelect.jsx'
 import RangeSelector from './components/RangeSelector.jsx'
-import SavedClips from './components/SavedClips.jsx'
 import { downloadMedia, inspectUrl, saveClip } from './api/client.js'
 
 function App() {
@@ -127,8 +126,6 @@ function App() {
             {status && <span className="status">{status}</span>}
           </div>
         </div>
-
-        <SavedClips />
       </main>
       <footer className="footer">Built with React + Flask + yt-dlp</footer>
     </div>

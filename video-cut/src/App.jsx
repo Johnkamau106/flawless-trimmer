@@ -11,6 +11,7 @@ function App() {
   const [meta, setMeta] = useState(null)
   const [formats, setFormats] = useState([])
   const [url, setUrl] = useState('')
+  const [playback, setPlayback] = useState(null)
   const [play, setPlay] = useState(false)
   const [duration, setDuration] = useState(0)
   const [range, setRange] = useState({ start: 0, end: 0 })
@@ -25,6 +26,7 @@ function App() {
       setMeta(data.metadata)
       setFormats(data.formats)
       setUrl(data.cleanedUrl || u)
+      setPlayback(data.playback || data.metadata?.playback || null)
       setPlay(true)
       setStatus('')
     } catch (e) {
@@ -105,7 +107,7 @@ function App() {
 
           {url ? (
             <div className="card">
-              <Player url={url} playing={play} onDuration={onDurationChange} onProgress={() => { }} />
+              <Player url={url} playback={playback} playing={play} onDuration={onDurationChange} onProgress={() => { }} />
               <div className="meta">
                 <div className="title" title={meta?.title}>{meta?.title}</div>
                 <div className="platform">{meta?.platform}</div>

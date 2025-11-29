@@ -233,9 +233,28 @@ def list_formats(url: str):
         info = ydl.extract_info(url, download=False)
 
     formats = []
+    best_playback = None
+
+    def choose_playback(f):
+        # Prioritize progressive mp4, then HLS, then DASH
+        proto = (f.get("protocol") or "").lower()
+        ext = (f.get("ext") or "").lower()
+        vcodec = f.get("vcodec")
+        acodec = f.get("acodec")
+        has_video = vcodec != "none" and vcodec is not None
+        has_audio = acodec != "none" and acodec is not None
+        if not has_video:
+            return None
+        if has_audio and ext == "mp4" and proto in {"https", "http"}:
+            return {"type": "mp4", "url": f.get("url")}
+        if proto in {"m3u8", "m3u8_native", "hls"}:
+            return {"type": "hls", "url": f.get("url")}
+        if proto in {"dash", "http_dash_segments"} or ext == "mpd":
+            return {"type": "dash", "url": f.get("url")}
+        return None
+
     for f in info.get("formats", []):
         if f.get("vcodec") != "none" and f.get("acodec") == "none":
-            # video-only; still allow but label
             kind = "video_only"
         elif f.get("vcodec") == "none" and f.get("acodec") != "none":
             kind = "audio"
@@ -253,7 +272,19 @@ def list_formats(url: str):
             "width": f.get("width"),
             "label": fmt_label,
             "kind": kind,
+            "protocol": f.get("protocol"),
+            "url": f.get("url"),
         })
+        if not best_playback:
+            cand = choose_playback(f)
+            if cand:
+                best_playback = cand
+
+    # As a fallback, some extractors provide top-level url for streaming
+    if not best_playback:
+        top_url = info.get("url")
+        if top_url:
+            best_playback = {"type": "mp4", "url": top_url}
 
     meta = {
         "id": info.get("id"),
@@ -263,6 +294,7 @@ def list_formats(url: str):
         "thumbnail": info.get("thumbnail"),
         "webpage_url": info.get("webpage_url") or url,
         "platform": detect_platform(url),
+        "playback": best_playback,
     }
     return meta, formats
 
@@ -427,7 +459,7 @@ def api_inspect():
     url = clean_youtube_params(url)
     try:
         meta, formats = list_formats(url)
-        return jsonify({"metadata": meta, "formats": formats, "cleanedUrl": url})
+        return jsonify({"metadata": meta, "formats": formats, "cleanedUrl": url, "playback": meta.get("playback")})
     except Exception as exc:
         # Provide clearer message for common blocked cases
         error_str = str(exc)

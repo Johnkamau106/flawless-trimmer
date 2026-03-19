@@ -112,6 +112,33 @@ def clean_youtube_params(url: str) -> str:
     return urlunparse(cleaned)
 
 
+def _safe_filename(title: str, ext: str) -> tuple:
+    """Return (ascii_filename, rfc5987_filename) for use in Content-Disposition headers.
+
+    ascii_filename is an ASCII-safe fallback. rfc5987_filename is the RFC5987 encoded
+    UTF-8 value (e.g. "UTF-8''%E2%82%ACname.mp4").
+    """
+    import unicodedata
+    from urllib.parse import quote
+
+    # Normalize and attempt to produce a readable ASCII fallback
+    nm = unicodedata.normalize("NFKD", (title or "video"))
+    ascii = nm.encode("ascii", "ignore").decode("ascii")
+    # Remove characters that are unsafe in filenames, replace spaces with underscores
+    ascii = re.sub(r"[^\w\-\s]", "", ascii).strip().replace(" ", "_")
+    if not ascii:
+        ascii = "video"
+    # Ensure ext has no leading dot
+    ext = (ext or "mp4").lstrip(".")
+    ascii_full = f"{ascii}.{ext}"
+
+    # RFC5987 encode the UTF-8 filename
+    utf8_quoted = quote((title or "video").encode("utf-8"))
+    rfc5987 = f"UTF-8''{utf8_quoted}.{ext}"
+
+    return ascii_full, rfc5987
+
+
 def detect_platform(url: str) -> str:
     host = urlparse(url).netloc.lower()
     if any(k in host for k in ["youtube.com", "youtu.be"]):
@@ -224,13 +251,37 @@ def _build_ydl_opts(base: Optional[dict] = None, for_url: Optional[str] = None) 
 
 
 def list_formats(url: str):
+    """Extract metadata and format list. Retry with alternate extractor args for YouTube if needed."""
     import yt_dlp
 
-    ydl_opts = _build_ydl_opts({
-        "skip_download": True,
-    }, for_url=url)
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=False)
+    last_exc = None
+    info = None
+
+    # Build a list of candidate ydl_opts to try - default first, then some YouTube-specific fallbacks
+    try_opts = []
+    try_opts.append(_build_ydl_opts({"skip_download": True}, for_url=url))
+
+    if detect_platform(url) == "youtube":
+        # Try alternative player_client orders (sometimes one works where another is blocked)
+        try_opts.append(_build_ydl_opts({"skip_download": True, "extractor_args": {"youtube": {"player_client": ["web"]}}}, for_url=url))
+        try_opts.append(_build_ydl_opts({"skip_download": True, "extractor_args": {"youtube": {"player_client": ["android"]}}}, for_url=url))
+        try_opts.append(_build_ydl_opts({"skip_download": True, "extractor_args": {"youtube": {"player_client": ["android_webview"]}}}, for_url=url))
+        try_opts.append(_build_ydl_opts({"skip_download": True, "extractor_args": {"youtube": {"player_client": ["tv_embedded"]}}}, for_url=url))
+        try_opts.append(_build_ydl_opts({"skip_download": True, "extractor_args": {"youtube": {"player_client": ["mweb"]}}}, for_url=url))
+
+    for ydl_opts in try_opts:
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+            break
+        except Exception as e:
+            last_exc = e
+            # try next opts
+            continue
+
+    if not info:
+        # raise the last extraction error to be handled by caller
+        raise last_exc or Exception("Failed to extract formats")
 
     formats = []
     best_playback = None
@@ -302,6 +353,7 @@ def list_formats(url: str):
 def download_media(url: str, format_id: Optional[str], audio_only: bool, start: Optional[float], end: Optional[float]):
     import yt_dlp
     import subprocess
+    import time
 
     temp_dir = tempfile.mkdtemp(prefix="vidslicer_")
     base_name = uuid.uuid4().hex
@@ -311,6 +363,7 @@ def download_media(url: str, format_id: Optional[str], audio_only: bool, start: 
         "outtmpl": download_path,
     }, for_url=url)
 
+    # Decide initial format choice
     if audio_only:
         ydl_opts.update({
             "format": "bestaudio/best",
@@ -322,48 +375,73 @@ def download_media(url: str, format_id: Optional[str], audio_only: bool, start: 
                 }
             ],
         })
-    elif format_id:
-        ydl_opts["format"] = format_id
+        preferred_format = ydl_opts["format"]
     else:
-        # For YouTube, prefer single best format to reduce concurrent requests
-        # For other platforms, merge video+audio for quality
-        if detect_platform(url) == "youtube":
-            ydl_opts.update({
-                "format": "best",  # Single stream format - less likely to hit rate limits
-                "merge_output_format": "mp4",
-            })
+        if format_id:
+            preferred_format = format_id
         else:
-            ydl_opts.update({
-                "format": "bestvideo*+bestaudio/best",
-                "merge_output_format": "mp4",
-            })
+            # For all non-specific cases, use bestvideo+bestaudio which works reliably
+            # The fallback chain below will handle edge cases
+            preferred_format = "bestvideo+bestaudio/best"
+            ydl_opts.update({"merge_output_format": "mp4"})
+        ydl_opts["format"] = preferred_format
 
-    # Retry download on failure with exponential backoff
-    max_retries = 2
+    # Retry download on failure with fallback handling
+    max_retries = 3
     last_error = None
     downloaded = None
     info = None
+    fallback_formats = []
     
+    # Define fallback format chains - try progressively simpler options
+    if not audio_only:
+        fallback_formats = [
+            "bestvideo+bestaudio/best",  # Primary: video + audio merge
+            "best[ext=mp4]/best",         # Best mp4 file
+            "best",                       # Absolute best available
+        ]
+    else:
+        fallback_formats = [
+            "bestaudio/best",
+            "best",
+        ]
+
     for attempt in range(max_retries + 1):
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=True)
+                # prepare_filename will return the file path based on info and outtmpl
                 downloaded = ydl.prepare_filename(info)
-                break  # Success, exit retry loop
+                break  # Success
         except Exception as e:
             last_error = e
             error_str = str(e)
-            # Don't retry on certain errors
+
+            # If the error is about a requested/selected format not being available, try next fallback
+            if ("Requested format is not available" in error_str or "format not available" in error_str.lower() or "requested format is not available" in error_str.lower()):
+                # Try next fallback format if available
+                if fallback_formats:
+                    next_format = fallback_formats.pop(0)
+                    if next_format != ydl_opts.get("format"):
+                        ydl_opts["format"] = next_format
+                        time.sleep(0.5)
+                        continue
+                # If no more fallbacks, raise the error
+                raise
+
+            # Don't retry on private/sign-in errors
             if "Private video" in error_str or "Sign in" in error_str or "not available" in error_str.lower():
                 raise
-            # Only retry on 403/rate limit errors
+
+            # Retry on common rate-limit/403 errors with backoff
             if attempt < max_retries and ("403" in error_str or "Forbidden" in error_str or "rate limit" in error_str.lower()):
-                import time
-                wait_time = (attempt + 1) * 2  # 2s, 4s
+                wait_time = (attempt + 1) * 2
                 time.sleep(wait_time)
                 continue
+
+            # Otherwise bubble up the error
             raise
-    
+
     if last_error and not downloaded:
         raise last_error
     if not info:
@@ -373,9 +451,8 @@ def download_media(url: str, format_id: Optional[str], audio_only: bool, start: 
     output_ext = "mp3" if audio_only else os.path.splitext(source_path)[1].lstrip(".")
     output_path = os.path.join(temp_dir, f"{base_name}.out.{output_ext}")
 
-    # Trim if needed
+    # Trim if needed (same strategy: try stream-copy then re-encode)
     if start is not None and end is not None and end > start:
-        # Use ffmpeg to trim - try fast copy first, then fast re-encode
         cmd = [
             "ffmpeg",
             "-y",
@@ -393,7 +470,6 @@ def download_media(url: str, format_id: Optional[str], audio_only: bool, start: 
         ]
         proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         if proc.returncode != 0:
-            # Fallback to fast re-encode with hardware acceleration if available
             cmd = [
                 "ffmpeg",
                 "-y",
@@ -406,7 +482,7 @@ def download_media(url: str, format_id: Optional[str], audio_only: bool, start: 
                 "-c:v",
                 "libx264",
                 "-preset",
-                "veryfast",  # Fast encoding preset
+                "veryfast",
                 "-crf",
                 "23",
                 "-c:a",
@@ -414,7 +490,7 @@ def download_media(url: str, format_id: Optional[str], audio_only: bool, start: 
                 "-b:a",
                 "128k",
                 "-movflags",
-                "+faststart",  # Optimize for streaming
+                "+faststart",
                 output_path,
             ]
             subprocess.check_call(cmd)
@@ -467,10 +543,14 @@ def api_inspect():
         plat = detect_platform(url)
         
         if plat == "youtube":
-            if "403" in error_str or "Forbidden" in error_str or "HTTP Error 403" in error_str:
+            if "signature" in error_str.lower() or "nsig" in error_str.lower() or "Precondition check failed" in error_str.lower():
+                hint = " — YouTube signature extraction failed (Python 3.8 compatibility issue). SOLUTION: 1) Upgrade Python to 3.9+ (recommended), 2) Export browser cookies (VIDSLICER_COOKIES_FROM_BROWSER='firefox') as a temporary workaround, 3) Use VIDSLICER_UA with a Firefox User-Agent string."
+            elif "403" in error_str or "Forbidden" in error_str or "HTTP Error 403" in error_str:
                 hint = " — YouTube is blocking access. Try: 1) Export cookies from your browser and set VIDSLICER_COOKIES, 2) Update yt-dlp: pip install -U yt-dlp, 3) Wait a few minutes and try again."
             elif "Private video" in error_str or "Sign in" in error_str:
                 hint = " — Video may be private or require sign-in. Export cookies from your browser and set VIDSLICER_COOKIES."
+            elif "not available" in error_str.lower():
+                hint = " — Video format not available. This usually means the video is geo-blocked, age-restricted, or has regional limitations. Try exporting cookies from a browser in the same region."
         elif plat in {"tiktok", "instagram", "facebook", "twitter"}:
             hint = " — site may require cookies/session. Set VIDSLICER_COOKIES or VIDSLICER_COOKIES_FROM_BROWSER."
         
@@ -511,9 +591,9 @@ def api_download():
                 title = info.get("title") or "video"
             except Exception:
                 title = "video"
-            safe_title = re.sub(r"[^\w\-\s]", "", title).strip().replace(" ", "_") or "video"
-            as_attachment_name = f"{safe_title}.{output_ext}"
-            
+            ascii_name, rfc5987_name = _safe_filename(title, output_ext)
+            cd_header = f'attachment; filename="{ascii_name}"; filename*={rfc5987_name}'
+
             def generate():
                 with open(cached_path, "rb") as f:
                     while True:
@@ -521,12 +601,12 @@ def api_download():
                         if not chunk:
                             break
                         yield chunk
-            
+
             response = Response(
                 stream_with_context(generate()),
                 mimetype="video/mp4" if not audio_only else "audio/mpeg",
                 headers={
-                    "Content-Disposition": f'attachment; filename="{as_attachment_name}"',
+                    "Content-Disposition": cd_header,
                     "Content-Length": str(os.path.getsize(cached_path)),
                 }
             )
@@ -539,10 +619,10 @@ def api_download():
         file_path = _save_to_cache(cache_key, file_path, output_ext)
         
         title = info.get("title") or "video"
-        safe_title = re.sub(r"[^\w\-\s]", "", title).strip().replace(" ", "_") or "video"
         ext = os.path.splitext(file_path)[1]
-        as_attachment_name = f"{safe_title}{ext}"
-        
+        ascii_name, rfc5987_name = _safe_filename(title, ext.lstrip("."))
+        cd_header = f'attachment; filename="{ascii_name}"; filename*={rfc5987_name}'
+
         # Stream file in chunks for better performance
         def generate():
             with open(file_path, "rb") as f:
@@ -551,12 +631,12 @@ def api_download():
                     if not chunk:
                         break
                     yield chunk
-        
+
         response = Response(
             stream_with_context(generate()),
             mimetype="video/mp4" if not audio_only else "audio/mpeg",
             headers={
-                "Content-Disposition": f'attachment; filename="{as_attachment_name}"',
+                "Content-Disposition": cd_header,
                 "Content-Length": str(os.path.getsize(file_path)),
             }
         )

@@ -4,7 +4,7 @@ import tempfile
 import uuid
 import hashlib
 import threading
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 from pathlib import Path
 from urllib.parse import urlparse, parse_qsl, urlunparse, urlencode
@@ -76,7 +76,7 @@ class Clip(db.Model):
     start_time = db.Column(db.Float, nullable=True)
     end_time = db.Column(db.Float, nullable=True)
     thumbnail_path = db.Column(db.Text, nullable=True)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
 
     def to_dict(self):
         return {
@@ -181,10 +181,16 @@ def _referer_for(url: str) -> Optional[str]:
 
 def _build_ydl_opts(base: Optional[dict] = None, for_url: Optional[str] = None) -> dict:
     is_youtube = for_url and detect_platform(for_url) == "youtube"
+    platform = detect_platform(for_url) if for_url else "unknown"
     
     # For YouTube, use fewer concurrent fragments to avoid rate limiting
-    # For other platforms, use more for speed
-    default_concurrent = 2 if is_youtube else int(os.environ.get("VIDSLICER_CONCURRENT_FRAGMENTS", "4"))
+    # For others, use aggressive concurrency for speed
+    if is_youtube:
+        default_concurrent = 2
+    elif platform in {"tiktok", "instagram", "x", "twitter"}:
+        default_concurrent = 16  # Aggressive for social media
+    else:
+        default_concurrent = 12
     concurrent_fragments = int(os.environ.get("VIDSLICER_CONCURRENT_FRAGMENTS", str(default_concurrent)))
     
     opts: dict = {
@@ -192,12 +198,14 @@ def _build_ydl_opts(base: Optional[dict] = None, for_url: Optional[str] = None) 
         "no_warnings": True,
         "noplaylist": True,
         "geo_bypass": True,
-        # Optimize download speed with concurrent fragments
+        # Speed up downloads with aggressive concurrency
         "concurrent_fragment_downloads": concurrent_fragments,
-        # Add retry logic for failed downloads
-        "retries": 3,
-        "fragment_retries": 3,
-        "file_access_retries": 3,
+        # Connection optimization for speed
+        "socket_timeout": 30,
+        # Minimal retries for speed (platforms will handle errors)
+        "retries": 0 if not is_youtube else 1,
+        "fragment_retries": 0 if not is_youtube else 1,
+        "file_access_retries": 0,
         # Use a realistic desktop UA to reduce blocking
         "http_headers": {
             "User-Agent": os.environ.get(
@@ -214,11 +222,16 @@ def _build_ydl_opts(base: Optional[dict] = None, for_url: Optional[str] = None) 
     if is_youtube:
         opts["extractor_args"] = {
             "youtube": {
-                "player_client": ["android", "web"],  # Try Android client first (less restrictions), fallback to web
+                "player_client": ["android", "web"],
             }
         }
-        # For YouTube, prefer single-stream formats to reduce concurrent requests
-        # This helps avoid rate limiting
+    # TikTok/Instagram specific - need browser cookies for better format access
+    elif platform in {"tiktok", "instagram"}:
+        opts["extractor_args"] = {
+            platform: {
+                "api_hostname": "api.tiktok.com",  # Use API for faster access
+            }
+        }
     
     cookiefile = os.environ.get("VIDSLICER_COOKIES")
     if cookiefile and os.path.exists(cookiefile):
@@ -287,7 +300,7 @@ def list_formats(url: str):
     best_playback = None
 
     def choose_playback(f):
-        # Prioritize progressive mp4, then HLS, then DASH
+        # Prioritize progressive mp4, then HLS, then DASH - works for all platforms
         proto = (f.get("protocol") or "").lower()
         ext = (f.get("ext") or "").lower()
         vcodec = f.get("vcodec")
@@ -296,12 +309,19 @@ def list_formats(url: str):
         has_audio = acodec != "none" and acodec is not None
         if not has_video:
             return None
+        # Try progressive MP4 with audio first (YouTube, TikTok, etc.)
         if has_audio and ext == "mp4" and proto in {"https", "http"}:
             return {"type": "mp4", "url": f.get("url")}
+        # HLS streams work well for most platforms (Instagram, TikTok, etc.)
+        # HLS is often faster even than MP4 for non-YouTube platforms
         if proto in {"m3u8", "m3u8_native", "hls"}:
             return {"type": "hls", "url": f.get("url")}
+        # DASH for high-quality videos
         if proto in {"dash", "http_dash_segments"} or ext == "mpd":
             return {"type": "dash", "url": f.get("url")}
+        # Fallback: any progressive format with http/https
+        if ext in {"mp4", "mkv", "webm"} and proto in {"https", "http"}:
+            return {"type": "mp4", "url": f.get("url")}
         return None
 
     for f in info.get("formats", []):
@@ -387,23 +407,36 @@ def download_media(url: str, format_id: Optional[str], audio_only: bool, start: 
         ydl_opts["format"] = preferred_format
 
     # Retry download on failure with fallback handling
-    max_retries = 3
+    # Reduced retries for faster downloads on non-YouTube platforms
+    max_retries = 1 if detect_platform(url) != "youtube" else 2
     last_error = None
     downloaded = None
     info = None
     fallback_formats = []
     
-    # Define fallback format chains - try progressively simpler options
+    # Define fallback format chains - optimized for speed per platform
     if not audio_only:
-        fallback_formats = [
-            "bestvideo+bestaudio/best",  # Primary: video + audio merge
-            "best[ext=mp4]/best",         # Best mp4 file
-            "best",                       # Absolute best available
-        ]
+        platform = detect_platform(url)
+        if platform == "youtube":
+            fallback_formats = [
+                "best[ext=mp4]/best",         # Fast: single-stream mp4
+                "bestvideo+bestaudio/best",  # Merge if needed
+                "best",                       # Fallback
+            ]
+        elif platform in {"tiktok", "instagram", "facebook"}:
+            # These prefer HLS/single streams for speed
+            fallback_formats = [
+                "best",                       # Fastest: whatever is available
+                "best[height>=480]",         # Reasonable quality fallback
+            ]
+        else:
+            fallback_formats = [
+                "best[height>=720]/best",
+                "best",
+            ]
     else:
         fallback_formats = [
             "bestaudio/best",
-            "best",
         ]
 
     for attempt in range(max_retries + 1):
@@ -433,11 +466,12 @@ def download_media(url: str, format_id: Optional[str], audio_only: bool, start: 
             if "Private video" in error_str or "Sign in" in error_str or "not available" in error_str.lower():
                 raise
 
-            # Retry on common rate-limit/403 errors with backoff
+            # Retry on rate-limit errors only (skip for most platforms to speed up)
             if attempt < max_retries and ("403" in error_str or "Forbidden" in error_str or "rate limit" in error_str.lower()):
-                wait_time = (attempt + 1) * 2
-                time.sleep(wait_time)
-                continue
+                if detect_platform(url) == "youtube":
+                    time.sleep((attempt + 1) * 0.5)
+                    continue
+                # For other platforms, don't retry on 403 - it's often permanent
 
             # Otherwise bubble up the error
             raise
@@ -544,15 +578,19 @@ def api_inspect():
         
         if plat == "youtube":
             if "signature" in error_str.lower() or "nsig" in error_str.lower() or "Precondition check failed" in error_str.lower():
-                hint = " — YouTube signature extraction failed (Python 3.8 compatibility issue). SOLUTION: 1) Upgrade Python to 3.9+ (recommended), 2) Export browser cookies (VIDSLICER_COOKIES_FROM_BROWSER='firefox') as a temporary workaround, 3) Use VIDSLICER_UA with a Firefox User-Agent string."
+                hint = " — YouTube signature extraction failed. Solution: Use Python 3.9+ or export browser cookies."
             elif "403" in error_str or "Forbidden" in error_str or "HTTP Error 403" in error_str:
-                hint = " — YouTube is blocking access. Try: 1) Export cookies from your browser and set VIDSLICER_COOKIES, 2) Update yt-dlp: pip install -U yt-dlp, 3) Wait a few minutes and try again."
+                hint = " — YouTube is blocking access. Try: 1) Export cookies from your browser, 2) Update yt-dlp, 3) Try again after a few minutes."
             elif "Private video" in error_str or "Sign in" in error_str:
-                hint = " — Video may be private or require sign-in. Export cookies from your browser and set VIDSLICER_COOKIES."
+                hint = " — Video may be private or require sign-in."
             elif "not available" in error_str.lower():
-                hint = " — Video format not available. This usually means the video is geo-blocked, age-restricted, or has regional limitations. Try exporting cookies from a browser in the same region."
-        elif plat in {"tiktok", "instagram", "facebook", "twitter"}:
-            hint = " — site may require cookies/session. Set VIDSLICER_COOKIES or VIDSLICER_COOKIES_FROM_BROWSER."
+                hint = " — Video format not available (geo-blocked or age-restricted)."
+        elif plat == "tiktok":
+            hint = " — TikTok requires authentication. Either: 1) Export cookies from TikTok in your browser (VIDSLICER_COOKIES_FROM_BROWSER='firefox'), 2) Some TikTok videos may not be downloadable due to platform restrictions."
+        elif plat == "instagram":
+            hint = " — Instagram requires authentication. Export cookies from Instagram (VIDSLICER_COOKIES_FROM_BROWSER='firefox') for access."
+        elif plat in {"x", "twitter", "facebook"}:
+            hint = " — Platform may require authentication. Export browser cookies for better access."
         
         return jsonify({"error": f"{error_str}{hint}"}), 400
 
@@ -672,7 +710,7 @@ def api_clip_save():
         "start_time": body.get("start_time"),
         "end_time": body.get("end_time"),
         "thumbnail": None,
-        "created_at": datetime.utcnow().isoformat(),
+        "created_at": datetime.now(timezone.utc).isoformat(),
     }
     return jsonify({"clip": resp_clip})
 

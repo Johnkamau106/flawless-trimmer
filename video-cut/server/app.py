@@ -184,13 +184,13 @@ def _build_ydl_opts(base: Optional[dict] = None, for_url: Optional[str] = None) 
     platform = detect_platform(for_url) if for_url else "unknown"
     
     # For YouTube, use fewer concurrent fragments to avoid rate limiting
-    # For others, use aggressive concurrency for speed
+    # For others, use very aggressive concurrency for maximum speed
     if is_youtube:
         default_concurrent = 2
     elif platform in {"tiktok", "instagram", "x", "twitter"}:
-        default_concurrent = 16  # Aggressive for social media
+        default_concurrent = 32  # VERY aggressive for social media (was 16)
     else:
-        default_concurrent = 12
+        default_concurrent = 24  # Increased from 12
     concurrent_fragments = int(os.environ.get("VIDSLICER_CONCURRENT_FRAGMENTS", str(default_concurrent)))
     
     opts: dict = {
@@ -198,14 +198,18 @@ def _build_ydl_opts(base: Optional[dict] = None, for_url: Optional[str] = None) 
         "no_warnings": True,
         "noplaylist": True,
         "geo_bypass": True,
-        # Speed up downloads with aggressive concurrency
+        # Speed up downloads with very aggressive concurrency
         "concurrent_fragment_downloads": concurrent_fragments,
-        # Connection optimization for speed
-        "socket_timeout": 30,
-        # Minimal retries for speed (platforms will handle errors)
+        # Increase fragment pool for parallel downloading
+        "fragment_pool_size": 64 if not is_youtube else 8,
+        # Connection optimization for speed - increased timeout for stability
+        "socket_timeout": 60,
+        # Aggressive: minimal retries (0 for non-YouTube)
         "retries": 0 if not is_youtube else 1,
         "fragment_retries": 0 if not is_youtube else 1,
         "file_access_retries": 0,
+        # Reduce connection pool wait time
+        "tcp_nodelay": True,
         # Use a realistic desktop UA to reduce blocking
         "http_headers": {
             "User-Agent": os.environ.get(
@@ -215,6 +219,7 @@ def _build_ydl_opts(base: Optional[dict] = None, for_url: Optional[str] = None) 
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Accept-Language": "en-us,en;q=0.5",
             "Sec-Fetch-Mode": "navigate",
+            "Connection": "keep-alive",
         },
     }
     
@@ -301,6 +306,7 @@ def list_formats(url: str):
 
     def choose_playback(f):
         # Prioritize progressive mp4, then HLS, then DASH - works for all platforms
+        # IMPORTANT: Be more flexible for platforms like TikTok/X to allow video-only or audio-only
         proto = (f.get("protocol") or "").lower()
         ext = (f.get("ext") or "").lower()
         vcodec = f.get("vcodec")
@@ -319,8 +325,14 @@ def list_formats(url: str):
         # DASH for high-quality videos
         if proto in {"dash", "http_dash_segments"} or ext == "mpd":
             return {"type": "dash", "url": f.get("url")}
+        # Progressive MP4 even without audio (TikTok, X videos often have video-only)
+        if ext == "mp4" and proto in {"https", "http"}:
+            return {"type": "mp4", "url": f.get("url")}
         # Fallback: any progressive format with http/https
         if ext in {"mp4", "mkv", "webm"} and proto in {"https", "http"}:
+            return {"type": "mp4", "url": f.get("url")}
+        # Last resort: accept video-only formats if nothing else works
+        if has_video and proto in {"https", "http"}:
             return {"type": "mp4", "url": f.get("url")}
         return None
 
@@ -424,13 +436,23 @@ def download_media(url: str, format_id: Optional[str], audio_only: bool, start: 
                 "best",                       # Fallback
             ]
         elif platform in {"tiktok", "instagram", "facebook"}:
-            # These prefer HLS/single streams for speed
+            # These platforms: prioritize playable MP4 formats for speed
             fallback_formats = [
-                "best",                       # Fastest: whatever is available
-                "best[height>=480]",         # Reasonable quality fallback
+                "best[ext=mp4]",              # FASTEST: best MP4 available (no merge)
+                "best[height>=480]/best",    # Good quality MP4
+                "best[height>=360]/best",    # Lower quality but plays
+                "best",                       # Whatever is available
+            ]
+        elif platform in {"x", "twitter"}:
+            # Twitter/X: similar to TikTok, prefer MP4
+            fallback_formats = [
+                "best[ext=mp4]",              # Best MP4 format
+                "best[height>=480]/best",
+                "best",
             ]
         else:
             fallback_formats = [
+                "best[ext=mp4]/best",
                 "best[height>=720]/best",
                 "best",
             ]

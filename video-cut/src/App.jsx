@@ -98,7 +98,7 @@ function App() {
   return (
     <div className="layout">
       <header className="header">
-        <h1>VidSlicer</h1>
+        <h1>Flawless VidSlicer</h1>
         <div className="muted">Paste a link, preview, trim, and download.</div>
       </header>
       <main className="main">

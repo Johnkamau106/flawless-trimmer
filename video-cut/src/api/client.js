@@ -12,6 +12,8 @@ export async function inspectUrl(url) {
   return data
 }
 
+// Note: downloadMedia is no longer used - using native browser downloads instead
+// Left here for reference if needed in future
 export async function downloadMedia(payload, onProgress) {
   const source = await api.post('/api/download', payload, {
     responseType: 'blob',

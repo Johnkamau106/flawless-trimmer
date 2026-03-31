@@ -4,9 +4,12 @@ import react from '@vitejs/plugin-react'
 // https://vite.dev/config/
 export default defineConfig({
   plugins: [react()],
-  // Avoid Windows file locking under /mnt/c by using WSL tmp for cache
-  cacheDir: '/tmp/vite-cache',
+  cacheDir: '.vite',
   server: {
+    middlewareMode: false,
+    warmup: {
+      clientFiles: ['./src/**/*.jsx', './src/main.jsx'],
+    },
     proxy: {
       '/api': {
         target: 'http://127.0.0.1:5000',
@@ -16,6 +19,12 @@ export default defineConfig({
         target: 'http://127.0.0.1:5000',
         changeOrigin: true,
       },
+    },
+  },
+  optimizeDeps: {
+    include: ['react', 'react-dom', 'react-player', 'hls.js', 'axios'],
+    esbuildOptions: {
+      target: 'esnext',
     },
   },
 })

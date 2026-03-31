@@ -1,8 +1,11 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useState, useRef } from 'react'
 
 export default function RangeSelector({ duration, start, end, onChange }) {
     const [localStart, setLocalStart] = useState(start ?? 0)
     const [localEnd, setLocalEnd] = useState(end ?? duration ?? 0)
+    const trackRef = useRef(null)
+    const startInputRef = useRef(null)
+    const endInputRef = useRef(null)
 
     useEffect(() => {
         setLocalStart(start ?? 0)
@@ -10,6 +13,30 @@ export default function RangeSelector({ duration, start, end, onChange }) {
     useEffect(() => {
         setLocalEnd(end ?? duration ?? 0)
     }, [end, duration])
+
+    // Manage z-index based on mouse position
+    function handleTrackMouseMove(e) {
+        if (!trackRef.current) return
+
+        const rect = trackRef.current.getBoundingClientRect()
+        const x = e.clientX - rect.left
+        const midpoint = rect.width / 2
+
+        // Bring whichever thumb is closer to the cursor to the front
+        if (x < midpoint) {
+            startInputRef.current?.style.setProperty('z-index', '6')
+            endInputRef.current?.style.setProperty('z-index', '4')
+        } else {
+            startInputRef.current?.style.setProperty('z-index', '4')
+            endInputRef.current?.style.setProperty('z-index', '6')
+        }
+    }
+
+    function handleTrackMouseLeave() {
+        // Default: end on top
+        startInputRef.current?.style.setProperty('z-index', '4')
+        endInputRef.current?.style.setProperty('z-index', '5')
+    }
 
     function clamp(val) {
         if (!duration) return 0
@@ -50,7 +77,7 @@ export default function RangeSelector({ duration, start, end, onChange }) {
 
     return (
         <div className="range-selector card">
-            <div className="range-track">
+            <div className="range-track" ref={trackRef} onMouseMove={handleTrackMouseMove} onMouseLeave={handleTrackMouseLeave}>
                 <div className="range-line" />
                 {duration ? (
                     <>
@@ -59,10 +86,11 @@ export default function RangeSelector({ duration, start, end, onChange }) {
                             className="range-selected"
                             style={{ left: `${positions.s}%`, width: `${Math.max(positions.e - positions.s, 0)}%` }}
                         />
-                        {/* Two inputs overlaid to act like two handles on one line */}
+                        {/* Start input */}
                         <input
+                            ref={startInputRef}
                             aria-label="Start"
-                            className="range-input"
+                            className="range-input range-input-start"
                             type="range"
                             min="0"
                             max={duration}
@@ -70,9 +98,11 @@ export default function RangeSelector({ duration, start, end, onChange }) {
                             value={localStart}
                             onChange={(e) => onStartChange(e.target.value)}
                         />
+                        {/* End input */}
                         <input
+                            ref={endInputRef}
                             aria-label="End"
-                            className="range-input"
+                            className="range-input range-input-end"
                             type="range"
                             min="0"
                             max={duration}

@@ -4,6 +4,7 @@ import tempfile
 import uuid
 import hashlib
 import threading
+import requests
 from datetime import datetime, timezone
 from typing import Optional
 from pathlib import Path
@@ -12,6 +13,13 @@ from urllib.parse import urlparse, parse_qsl, urlunparse, urlencode
 from flask import Flask, jsonify, request, send_file, Response, stream_with_context
 from flask_cors import CORS
 from flask_sqlalchemy import SQLAlchemy
+
+# Load environment variables from .env file if present
+try:
+    from dotenv import load_dotenv
+    load_dotenv(os.path.join(os.path.dirname(__file__), '.env'))
+except ImportError:
+    pass  # python-dotenv not installed, skip
 
 
 DB_PATH = os.environ.get("VIDSLICER_DB", os.path.join(os.path.dirname(__file__), "vidslicer.db"))
@@ -60,6 +68,29 @@ app = Flask(__name__)
 app.config["SQLALCHEMY_DATABASE_URI"] = f"sqlite:///{DB_PATH}"
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 app.config["JSON_SORT_KEYS"] = False
+
+# ========== TIMEOUT CONFIGURATION FOR LONG VIDEOS ==========
+# Set to 0 to disable timeout (allow infinite transfer time)
+# Videos can be 1+ hours, so we need very long timeout
+app.config["SEND_FILE_MAX_AGE_DEFAULT"] = 0  # Disable browser caching
+# For Gunicorn/WSGI servers, set via environment or use send_file with timeout parameter
+# For development (Flask dev server), set this in environment or use timeout param in send operations
+BASE_DOWNLOAD_TIMEOUT = int(os.environ.get("VIDSLICER_DOWNLOAD_TIMEOUT", "300"))  # 5 minutes base, will auto-scale
+DYNAMIC_TIMEOUT = BASE_DOWNLOAD_TIMEOUT  # Will be adjusted per download based on video duration
+
+def calculate_timeout_for_duration(duration_seconds):
+    """
+    Calculate appropriate timeout based on video duration.
+    Ensures downloads never timeout regardless of video length.
+    Formula: (duration * 1.5) + 120 = generous buffer for slow networks
+    """
+    if not duration_seconds or duration_seconds <= 0:
+        # Unknown duration - use a safe 2-hour default
+        return 7200
+    # 1.5x multiplier gives buffer for slow networks, +2min buffer
+    calculated = int((duration_seconds * 1.5) + 120)
+    # Ensure minimum of 5 minutes
+    return max(calculated, 300)
 
 CORS(app)
 db = SQLAlchemy(app)
@@ -504,7 +535,9 @@ def download_media(url: str, format_id: Optional[str], audio_only: bool, start: 
         raise Exception("Failed to download video information")
 
     source_path = downloaded
-    output_ext = "mp3" if audio_only else os.path.splitext(source_path)[1].lstrip(".")
+    # Always use standard containers: mp3 for audio, mp4 for video
+    # (don't use the downloaded file's extension, which may be unexpected like .mhtml)
+    output_ext = "mp3" if audio_only else "mp4"
     output_path = os.path.join(temp_dir, f"{base_name}.out.{output_ext}")
 
     # Trim if needed (same strategy: try stream-copy then re-encode)
@@ -552,7 +585,48 @@ def download_media(url: str, format_id: Optional[str], audio_only: bool, start: 
             subprocess.check_call(cmd)
         final_path = output_path
     else:
-        final_path = source_path
+        # If no trimming needed, still need to ensure proper format
+        # If source has unexpected extension, convert to mp4
+        source_ext = os.path.splitext(source_path)[1].lstrip(".")
+        if source_ext.lower() not in {"mp4", "mkv", "webm", "mov", "flv", "avi", "m4a", "m4v", "3gp", "opus"}:
+            # Unexpected extension (e.g., .mhtml) - convert to mp4
+            cmd = [
+                "ffmpeg",
+                "-y",
+                "-i",
+                source_path,
+                "-c:v",
+                "copy",
+                "-c:a",
+                "copy",
+                output_path,
+            ]
+            try:
+                subprocess.check_call(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                final_path = output_path
+            except Exception:
+                # If copy fails, re-encode
+                cmd = [
+                    "ffmpeg",
+                    "-y",
+                    "-i",
+                    source_path,
+                    "-c:v",
+                    "libx264",
+                    "-preset",
+                    "veryfast",
+                    "-crf",
+                    "23",
+                    "-c:a",
+                    "aac",
+                    "-b:a",
+                    "128k",
+                    output_path,
+                ]
+                subprocess.check_call(cmd)
+                final_path = output_path
+        else:
+            final_path = source_path
 
     return final_path, info
 
@@ -617,8 +691,9 @@ def api_inspect():
         return jsonify({"error": f"{error_str}{hint}"}), 400
 
 
-@app.route("/api/download", methods=["POST"])
-def api_download():
+@app.route("/api/get-download-url", methods=["POST"])
+def api_get_download_url():
+    """Get direct download URL from video source - browser downloads directly, not through our server."""
     err = require_yt_dlp()
     if err:
         return jsonify({"error": f"yt-dlp missing or broken: {err}"}), 500
@@ -627,79 +702,158 @@ def api_download():
     url = body.get("url", "").strip()
     format_id = body.get("format_id")
     audio_only = bool(body.get("audio_only"))
-    start = body.get("start")
-    end = body.get("end")
 
     if not url:
         return jsonify({"error": "Missing url"}), 400
 
     url = clean_youtube_params(url)
     
-    # Check cache first
-    cache_key = _cache_key(url, format_id, audio_only, start, end)
-    output_ext = "mp3" if audio_only else "mp4"
-    cached_path = _get_cached_path(cache_key, output_ext)
+    try:
+        # Get video info
+        import yt_dlp
+        ydl_opts = _build_ydl_opts({"skip_download": True}, for_url=url)
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+        
+        # Get the format we want
+        if audio_only:
+            # Find best audio format
+            best_audio = None
+            for f in info.get("formats", []):
+                if f.get("acodec") != "none" and f.get("vcodec") == "none":
+                    if not best_audio or f.get("abr", 0) > best_audio.get("abr", 0):
+                        best_audio = f
+            if not best_audio:
+                raise Exception("No audio format available")
+            format_url = best_audio.get("url")
+            filename = f"{(info.get('title') or 'audio')}.m4a"
+        else:
+            # Find specific format or best video
+            target_format = None
+            if format_id:
+                for f in info.get("formats", []):
+                    if f.get("format_id") == format_id:
+                        target_format = f
+                        break
+            else:
+                # Default to best video+audio combined
+                for f in info.get("formats", []):
+                    if f.get("vcodec") != "none" and f.get("acodec") != "none":
+                        if not target_format or f.get("height", 0) > target_format.get("height", 0):
+                            target_format = f
+            
+            if not target_format:
+                raise Exception("Format not available")
+            
+            format_url = target_format.get("url")
+            filename = f"{(info.get('title') or 'video')}.mp4"
+        
+        if not format_url:
+            raise Exception("Could not get download URL from video source")
+        
+        # Return the direct URL
+        return jsonify({
+            "download_url": format_url,
+            "filename": filename,
+            "title": info.get("title")
+        })
+        
+    except Exception as exc:
+        error_str = str(exc)
+        hint = ""
+        plat = detect_platform(url)
+        
+        if plat == "youtube":
+            if "signature" in error_str.lower() or "nsig" in error_str.lower():
+                hint = " — YouTube signature extraction failed. Try exporting cookies from your browser."
+            elif "403" in error_str or "Forbidden" in error_str:
+                hint = " — YouTube is blocking access. Try exporting cookies or retry later."
+        elif plat in {"tiktok", "instagram"}:
+            hint = " — Platform requires authentication. Export browser cookies for access."
+        
+        return jsonify({"error": f"{error_str}{hint}"}), 400
+
+
+@app.route("/api/download", methods=["POST"])
+def api_download():
+    """Proxy-stream video from CDN to browser (backend fetches, browser receives)."""
+    err = require_yt_dlp()
+    if err:
+        return jsonify({"error": f"yt-dlp missing or broken: {err}"}), 500
+
+    body = request.get_json(silent=True) or {}
+    url = body.get("url", "").strip()
+    format_id = body.get("format_id", "").strip() or None
+    audio_only = bool(body.get("audio_only"))
+
+    if not url:
+        return jsonify({"error": "Missing url"}), 400
+
+    url = clean_youtube_params(url)
     
     try:
-        if cached_path:
-            # Serve from cache - need to get metadata for title
-            try:
-                import yt_dlp
-                ydl_opts = _build_ydl_opts({"skip_download": True}, for_url=url)
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    info = ydl.extract_info(url, download=False)
-                title = info.get("title") or "video"
-            except Exception:
-                title = "video"
-            ascii_name, rfc5987_name = _safe_filename(title, output_ext)
-            cd_header = f'attachment; filename="{ascii_name}"; filename*={rfc5987_name}'
-
-            def generate():
-                with open(cached_path, "rb") as f:
-                    while True:
-                        chunk = f.read(8192)  # 8KB chunks
-                        if not chunk:
-                            break
-                        yield chunk
-
-            response = Response(
-                stream_with_context(generate()),
-                mimetype="video/mp4" if not audio_only else "audio/mpeg",
-                headers={
-                    "Content-Disposition": cd_header,
-                    "Content-Length": str(os.path.getsize(cached_path)),
-                }
-            )
-            return response
+        # Get video info and direct download URL from source
+        import yt_dlp
+        ydl_opts = _build_ydl_opts({"skip_download": True}, for_url=url)
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
         
-        # Download and process
-        file_path, info = download_media(url, format_id, audio_only, start, end)
+        # Get the direct download URL from the video source
+        download_url = None
+        filename = (info.get("title") or "video")
         
-        # Save to cache
-        file_path = _save_to_cache(cache_key, file_path, output_ext)
+        if audio_only:
+            # Find best audio format
+            best_audio = None
+            for f in info.get("formats", []):
+                if f.get("acodec") != "none" and f.get("vcodec") == "none":
+                    if not best_audio or f.get("abr", 0) > best_audio.get("abr", 0):
+                        best_audio = f
+            if best_audio:
+                download_url = best_audio.get("url")
+                filename = f"{filename}.m4a"
+        else:
+            # Find best video format (prefer MP4 with audio)
+            target_format = None
+            for f in info.get("formats", []):
+                if f.get("vcodec") != "none" and f.get("acodec") != "none":
+                    if not target_format or f.get("height", 0) > target_format.get("height", 0):
+                        target_format = f
+            if target_format:
+                download_url = target_format.get("url")
+                filename = f"{filename}.mp4"
         
-        title = info.get("title") or "video"
-        ext = os.path.splitext(file_path)[1]
-        ascii_name, rfc5987_name = _safe_filename(title, ext.lstrip("."))
+        if not download_url:
+            raise Exception("No suitable format found for download")
+        
+        # Fetch from CDN and stream to browser (no disk storage)
+        # Backend can bypass CORS, browser cannot
+        import requests
+        video_response = requests.get(download_url, stream=True, timeout=30)
+        video_response.raise_for_status()
+        
+        # Generate filename with proper encoding
+        ascii_name, rfc5987_name = _safe_filename(filename.replace(".mp4", "").replace(".m4a", ""), 
+                                                    "mp4" if not audio_only else "m4a")
         cd_header = f'attachment; filename="{ascii_name}"; filename*={rfc5987_name}'
-
-        # Stream file in chunks for better performance
+        
+        # Stream response directly to browser (backend proxies)
         def generate():
-            with open(file_path, "rb") as f:
-                while True:
-                    chunk = f.read(8192)  # 8KB chunks
-                    if not chunk:
-                        break
+            """Stream video chunks from CDN to browser."""
+            chunk_size = 8192  # 8KB chunks
+            for chunk in video_response.iter_content(chunk_size=chunk_size):
+                if chunk:
                     yield chunk
-
+        
         response = Response(
             stream_with_context(generate()),
-            mimetype="video/mp4" if not audio_only else "audio/mpeg",
+            mimetype="video/mp4" if not audio_only else "audio/mp4",
             headers={
                 "Content-Disposition": cd_header,
-                "Content-Length": str(os.path.getsize(file_path)),
+                "Cache-Control": "no-cache, no-store, must-revalidate",
             }
         )
+        response.timeout = None
         return response
         
     except Exception as exc:
@@ -707,34 +861,98 @@ def api_download():
         hint = ""
         plat = detect_platform(url)
         
-        # Check for common YouTube blocking errors
         if plat == "youtube":
-            if "403" in error_str or "Forbidden" in error_str or "HTTP Error 403" in error_str:
-                hint = " — YouTube is blocking the download. Try: 1) Export cookies from your browser and set VIDSLICER_COOKIES, 2) Update yt-dlp: pip install -U yt-dlp, 3) Wait a few minutes and try again."
+            if "403" in error_str or "Forbidden" in error_str:
+                hint = " — YouTube is blocking. Try exporting cookies from your browser."
             elif "Private video" in error_str or "Sign in" in error_str:
-                hint = " — Video may be private or require sign-in. Export cookies from your browser and set VIDSLICER_COOKIES."
-        elif plat in {"tiktok", "instagram", "facebook", "twitter"}:
-            hint = " — site may require cookies/session. Set VIDSLICER_COOKIES or VIDSLICER_COOKIES_FROM_BROWSER."
+                hint = " — Video is private or requires sign-in."
+        elif plat in {"tiktok", "instagram"}:
+            hint = " — Platform requires authentication. Export browser cookies."
         
         return jsonify({"error": f"{error_str}{hint}"}), 400
 
 
 @app.route("/api/clip", methods=["POST"])
 def api_clip_save():
+    """Download, trim, and save video clip. Returns the trimmed video file."""
+    err = require_yt_dlp()
+    if err:
+        return jsonify({"error": f"yt-dlp missing or broken: {err}"}), 500
+    
     body = request.get_json(silent=True) or {}
-    # Simulate a fake clip ID (e.g., 1) and use the incoming data in the response.
-    resp_clip = {
-        "id": 1,
-        "url": body.get("url"),
-        "platform": detect_platform(body.get("url") or ""),
-        "title": body.get("title"),
-        "duration": body.get("duration"),
-        "start_time": body.get("start_time"),
-        "end_time": body.get("end_time"),
-        "thumbnail": None,
-        "created_at": datetime.now(timezone.utc).isoformat(),
-    }
-    return jsonify({"clip": resp_clip})
+    url = body.get("url", "").strip()
+    format_id = body.get("format_id", "").strip() or None
+    audio_only = bool(body.get("audio_only"))
+    start_time = body.get("start_time")
+    end_time = body.get("end_time")
+    title = body.get("title")
+    
+    if not url:
+        return jsonify({"error": "Missing url"}), 400
+    
+    url = clean_youtube_params(url)
+    
+    try:
+        # Download and trim the video
+        if start_time is not None and end_time is not None and end_time > start_time:
+            final_path, info = download_media(url, format_id, audio_only, start_time, end_time)
+        else:
+            # Download without trimming (full video)
+            final_path, info = download_media(url, format_id, audio_only, None, None)
+        
+        filename = title or info.get("title") or "clip"
+        ext = "m4a" if audio_only else "mp4"
+        filename = f"{filename}.{ext}"
+        
+        # Read file and send it
+        def generate():
+            chunk_size = 8192
+            try:
+                with open(final_path, 'rb') as f:
+                    while True:
+                        chunk = f.read(chunk_size)
+                        if not chunk:
+                            break
+                        yield chunk
+            finally:
+                # Cleanup temp files
+                try:
+                    import shutil
+                    temp_dir = os.path.dirname(final_path)
+                    shutil.rmtree(temp_dir, ignore_errors=True)
+                except Exception:
+                    pass
+        
+        ascii_name, rfc5987_name = _safe_filename(filename.replace(".mp4", "").replace(".m4a", ""), 
+                                                    ext)
+        cd_header = f'attachment; filename="{ascii_name}"; filename*={rfc5987_name}'
+        
+        response = Response(
+            stream_with_context(generate()),
+            mimetype="video/mp4" if not audio_only else "audio/mp4",
+            headers={
+                "Content-Disposition": cd_header,
+                "Cache-Control": "no-cache, no-store, must-revalidate",
+                "Connection": "keep-alive",
+            }
+        )
+        response.timeout = None
+        return response
+        
+    except Exception as exc:
+        error_str = str(exc)
+        hint = ""
+        plat = detect_platform(url)
+        
+        if plat == "youtube":
+            if "403" in error_str or "Forbidden" in error_str:
+                hint = " — YouTube is blocking the download. Try exporting cookies from your browser."
+            elif "Private video" in error_str or "Sign in" in error_str:
+                hint = " — Video is private or requires sign-in."
+        elif plat in {"tiktok", "instagram"}:
+            hint = " — Platform requires authentication. Export cookies from your browser."
+        
+        return jsonify({"error": f"{error_str}{hint}"}), 400
 
 
 @app.route("/api/clips", methods=["GET"])

@@ -20,7 +20,7 @@ export default function UrlInput({ onSubmit, loading }) {
                 required
             />
             <button className="btn" type="submit" disabled={loading}>
-                {loading ? 'Inspecting…' : 'Fetch'}
+                {loading ? <span className="spinner">◌</span> : '🔍'}
             </button>
         </form>
     )

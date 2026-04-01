@@ -496,8 +496,13 @@ def download_media(url: str, format_id: Optional[str], audio_only: bool, start: 
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=True)
-                # prepare_filename will return the file path based on info and outtmpl
-                downloaded = ydl.prepare_filename(info)
+                # Don't rely on prepare_filename with postprocessors - find the actual downloaded file
+                # List temp directory and find the downloaded file (should be base_name.*)
+                actual_files = [f for f in os.listdir(temp_dir) if f.startswith(base_name)]
+                if not actual_files:
+                    raise Exception(f"No downloaded file found in {temp_dir} (base: {base_name})")
+                # Use the first file found (should only be one primary file)
+                downloaded = os.path.join(temp_dir, actual_files[0])
                 break  # Success
         except Exception as e:
             last_error = e
@@ -559,29 +564,51 @@ def download_media(url: str, format_id: Optional[str], audio_only: bool, start: 
         ]
         proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         if proc.returncode != 0:
-            cmd = [
-                "ffmpeg",
-                "-y",
-                "-ss",
-                str(start),
-                "-to",
-                str(end),
-                "-i",
-                source_path,
-                "-c:v",
-                "libx264",
-                "-preset",
-                "veryfast",
-                "-crf",
-                "23",
-                "-c:a",
-                "aac",
-                "-b:a",
-                "128k",
-                "-movflags",
-                "+faststart",
-                output_path,
-            ]
+            # Re-encode on failure - use audio-only codec for audio, video+audio for video
+            if audio_only:
+                # Audio-only: encode to mp3 with libmp3lame
+                cmd = [
+                    "ffmpeg",
+                    "-y",
+                    "-ss",
+                    str(start),
+                    "-to",
+                    str(end),
+                    "-i",
+                    source_path,
+                    "-c:a",
+                    "libmp3lame",
+                    "-b:a",
+                    "192k",
+                    "-q:a",
+                    "4",
+                    output_path,
+                ]
+            else:
+                # Video: encode with both video and audio codecs
+                cmd = [
+                    "ffmpeg",
+                    "-y",
+                    "-ss",
+                    str(start),
+                    "-to",
+                    str(end),
+                    "-i",
+                    source_path,
+                    "-c:v",
+                    "libx264",
+                    "-preset",
+                    "veryfast",
+                    "-crf",
+                    "23",
+                    "-c:a",
+                    "aac",
+                    "-b:a",
+                    "128k",
+                    "-movflags",
+                    "+faststart",
+                    output_path,
+                ]
             subprocess.check_call(cmd)
         final_path = output_path
     else:
@@ -605,24 +632,41 @@ def download_media(url: str, format_id: Optional[str], audio_only: bool, start: 
                 subprocess.check_call(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 final_path = output_path
             except Exception:
-                # If copy fails, re-encode
-                cmd = [
-                    "ffmpeg",
-                    "-y",
-                    "-i",
-                    source_path,
-                    "-c:v",
-                    "libx264",
-                    "-preset",
-                    "veryfast",
-                    "-crf",
-                    "23",
-                    "-c:a",
-                    "aac",
-                    "-b:a",
-                    "128k",
-                    output_path,
-                ]
+                # If copy fails, re-encode - use audio-only codec for audio, video+audio for video
+                if audio_only:
+                    # Audio-only: encode to mp3 with libmp3lame
+                    cmd = [
+                        "ffmpeg",
+                        "-y",
+                        "-i",
+                        source_path,
+                        "-c:a",
+                        "libmp3lame",
+                        "-b:a",
+                        "192k",
+                        "-q:a",
+                        "4",
+                        output_path,
+                    ]
+                else:
+                    # Video: encode with both video and audio codecs
+                    cmd = [
+                        "ffmpeg",
+                        "-y",
+                        "-i",
+                        source_path,
+                        "-c:v",
+                        "libx264",
+                        "-preset",
+                        "veryfast",
+                        "-crf",
+                        "23",
+                        "-c:a",
+                        "aac",
+                        "-b:a",
+                        "128k",
+                        output_path,
+                    ]
                 subprocess.check_call(cmd)
                 final_path = output_path
         else:
@@ -901,7 +945,7 @@ def api_clip_save():
             final_path, info = download_media(url, format_id, audio_only, None, None)
         
         filename = title or info.get("title") or "clip"
-        ext = "m4a" if audio_only else "mp4"
+        ext = "mp3" if audio_only else "mp4"
         filename = f"{filename}.{ext}"
         
         # Read file and send it

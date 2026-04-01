@@ -17,6 +17,8 @@ function App() {
   const [range, setRange] = useState({ start: 0, end: 0 })
   const [quality, setQuality] = useState('')
   const [status, setStatus] = useState('')
+  const [isTrimmed, setIsTrimmed] = useState(false)
+  const [isDownloaded, setIsDownloaded] = useState(false)
 
   async function onSubmit(u) {
     setLoading(true)
@@ -42,6 +44,21 @@ function App() {
   }
 
   const isAudio = quality === 'audio:mp3'
+
+  function handleRangeChange(newRange) {
+    setRange(newRange)
+    // Mark as trimmed if user has changed the range from defaults
+    const startTrimmed = newRange.start > 1.0
+    const endTrimmed = duration && (duration - newRange.end) > 1.0
+    if (startTrimmed || endTrimmed) {
+      setIsTrimmed(true)
+    }
+  }
+
+  function handleQualityChange(q) {
+    setQuality(q)
+    setIsTrimmed(true)
+  }
 
   async function onDownload() {
     if (!url) return
@@ -154,6 +171,7 @@ function App() {
       }
 
       setStatus('✓ Download complete! Check your Downloads folder.')
+      setIsDownloaded(true)
 
       // Fire and forget - save clip to history (metadata only)
       try {
@@ -170,7 +188,7 @@ function App() {
     }
   }
 
-  const currentStep = !url ? 1 : !meta ? 2 : 3
+  const currentStep = isDownloaded ? 4 : isTrimmed ? 3 : meta ? 2 : url ? 1 : 0
 
   return (
     <div className="layout">
@@ -196,7 +214,7 @@ function App() {
           <div className="step-label">Trim & Quality</div>
         </div>
         <div className="step-line"></div>
-        <div className={`step ${currentStep >= 3 ? 'active' : ''}`}>
+        <div className={`step ${currentStep >= 4 ? 'active' : ''}`}>
           <div className="step-number">4</div>
           <div className="step-label">Download</div>
         </div>
@@ -237,11 +255,11 @@ function App() {
             </div>
             <div className="controls-grid">
               {formats?.length ? (
-                <QualitySelect formats={formats} selected={quality} onChange={setQuality} />
+                <QualitySelect formats={formats} selected={quality} onChange={handleQualityChange} />
               ) : null}
 
               {typeof meta?.duration === 'number' ? (
-                <RangeSelector duration={meta.duration} start={range.start} end={range.end} onChange={setRange} />
+                <RangeSelector duration={meta.duration} start={range.start} end={range.end} onChange={handleRangeChange} />
               ) : null}
             </div>
           </section>

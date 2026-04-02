@@ -400,6 +400,32 @@ def list_formats(url: str):
         if top_url:
             best_playback = {"type": "mp4", "url": top_url}
 
+    # For TikTok/Twitter: prioritize HLS if available (more stable), otherwise add webpage fallback
+    platform = detect_platform(url)
+    webpage_url = info.get("webpage_url") or url
+    
+    if platform in {"tiktok", "x", "twitter"}:
+        # HLS streams are more reliable for these platforms
+        hls_playback = next(({"type": "hls", "url": f.get("url")} 
+                           for f in info.get("formats", []) 
+                           if (f.get("protocol") or "").lower() in {"m3u8", "m3u8_native", "hls"}), 
+                          None)
+        if hls_playback:
+            best_playback = hls_playback
+        elif not best_playback:
+            # For TikTok, create embed URL; for Twitter use webpage URL
+            if platform == "tiktok":
+                video_id = info.get("id")
+                if video_id:
+                    # TikTok embed URL format
+                    embed_url = f"https://www.tiktok.com/embed/v2/{video_id}"
+                    best_playback = {"type": "webpage", "url": embed_url}
+                else:
+                    best_playback = {"type": "webpage", "url": webpage_url}
+            else:
+                # Twitter/X can use webpage URL directly
+                best_playback = {"type": "webpage", "url": webpage_url}
+
     meta = {
         "id": info.get("id"),
         "title": info.get("title"),
@@ -468,7 +494,9 @@ def download_media(url: str, format_id: Optional[str], audio_only: bool, start: 
             ]
         elif platform in {"tiktok", "instagram", "facebook"}:
             # These platforms: prioritize playable MP4 formats for speed
+            # For TikTok: explicitly avoid formats with format_id that may contain ads/problematic codecs
             fallback_formats = [
+                "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]",  # Merge video+audio for TikTok (better quality)
                 "best[ext=mp4]",              # FASTEST: best MP4 available (no merge)
                 "best[height>=480]/best",    # Good quality MP4
                 "best[height>=360]/best",    # Lower quality but plays
@@ -477,6 +505,7 @@ def download_media(url: str, format_id: Optional[str], audio_only: bool, start: 
         elif platform in {"x", "twitter"}:
             # Twitter/X: similar to TikTok, prefer MP4
             fallback_formats = [
+                "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]",  # Merge for better compatibility
                 "best[ext=mp4]",              # Best MP4 format
                 "best[height>=480]/best",
                 "best",
@@ -515,6 +544,9 @@ def download_media(url: str, format_id: Optional[str], audio_only: bool, start: 
                     next_format = fallback_formats.pop(0)
                     if next_format != ydl_opts.get("format"):
                         ydl_opts["format"] = next_format
+                        # Ensure merge_output_format is set for merges
+                        if "bestvideo" in next_format or "video" in next_format.lower():
+                            ydl_opts["merge_output_format"] = "mp4"
                         time.sleep(0.5)
                         continue
                 # If no more fallbacks, raise the error
@@ -820,7 +852,7 @@ def api_get_download_url():
 
 @app.route("/api/download", methods=["POST"])
 def api_download():
-    """Proxy-stream video from CDN to browser (backend fetches, browser receives)."""
+    """Download video with proper format merging support for all platforms."""
     err = require_yt_dlp()
     if err:
         return jsonify({"error": f"yt-dlp missing or broken: {err}"}), 500
@@ -836,68 +868,56 @@ def api_download():
     url = clean_youtube_params(url)
     
     try:
-        # Get video info and direct download URL from source
-        import yt_dlp
-        ydl_opts = _build_ydl_opts({"skip_download": True}, for_url=url)
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
+        # Use download_media which handles all format merging and fallback logic
+        # This supports platforms like Reddit that have separate video/audio streams
+        downloaded_file, info = download_media(url, format_id, audio_only, None, None)
         
-        # Get the direct download URL from the video source
-        download_url = None
-        filename = (info.get("title") or "video")
+        if not downloaded_file or not os.path.exists(downloaded_file):
+            raise Exception("Failed to download media file")
         
-        if audio_only:
-            # Find best audio format
-            best_audio = None
-            for f in info.get("formats", []):
-                if f.get("acodec") != "none" and f.get("vcodec") == "none":
-                    if not best_audio or f.get("abr", 0) > best_audio.get("abr", 0):
-                        best_audio = f
-            if best_audio:
-                download_url = best_audio.get("url")
-                filename = f"{filename}.m4a"
-        else:
-            # Find best video format (prefer MP4 with audio)
-            target_format = None
-            for f in info.get("formats", []):
-                if f.get("vcodec") != "none" and f.get("acodec") != "none":
-                    if not target_format or f.get("height", 0) > target_format.get("height", 0):
-                        target_format = f
-            if target_format:
-                download_url = target_format.get("url")
-                filename = f"{filename}.mp4"
+        # Get filename from the downloaded file
+        filename = os.path.basename(downloaded_file)
+        ext = os.path.splitext(filename)[1].lstrip('.')
         
-        if not download_url:
-            raise Exception("No suitable format found for download")
-        
-        # Fetch from CDN and stream to browser (no disk storage)
-        # Backend can bypass CORS, browser cannot
-        import requests
-        video_response = requests.get(download_url, stream=True, timeout=30)
-        video_response.raise_for_status()
+        # Get video title for better filename
+        title = info.get("title") or "video" if info else "video"
         
         # Generate filename with proper encoding
-        ascii_name, rfc5987_name = _safe_filename(filename.replace(".mp4", "").replace(".m4a", ""), 
-                                                    "mp4" if not audio_only else "m4a")
+        ascii_name, rfc5987_name = _safe_filename(title, ext)
         cd_header = f'attachment; filename="{ascii_name}"; filename*={rfc5987_name}'
         
-        # Stream response directly to browser (backend proxies)
-        def generate():
-            """Stream video chunks from CDN to browser."""
-            chunk_size = 8192  # 8KB chunks
-            for chunk in video_response.iter_content(chunk_size=chunk_size):
-                if chunk:
-                    yield chunk
+        # Calculate timeout based on file size
+        file_size = os.path.getsize(downloaded_file)
+        # Estimate: 2 MiB/s minimum, so timeout = (size_bytes / 2MB) + 30s buffer
+        timeout = max(int((file_size / (2 * 1024 * 1024)) + 30), 30)
+        
+        def cleanup_and_serve():
+            """Serve file and clean up temp directory."""
+            try:
+                with open(downloaded_file, 'rb') as f:
+                    while True:
+                        chunk = f.read(8192)
+                        if not chunk:
+                            break
+                        yield chunk
+            finally:
+                # Clean up temp directory after serving
+                import shutil
+                temp_dir = os.path.dirname(downloaded_file)
+                try:
+                    shutil.rmtree(temp_dir, ignore_errors=True)
+                except:
+                    pass
         
         response = Response(
-            stream_with_context(generate()),
+            stream_with_context(cleanup_and_serve()),
             mimetype="video/mp4" if not audio_only else "audio/mp4",
             headers={
                 "Content-Disposition": cd_header,
                 "Cache-Control": "no-cache, no-store, must-revalidate",
             }
         )
-        response.timeout = None
+        response.timeout = timeout
         return response
         
     except Exception as exc:
@@ -910,6 +930,8 @@ def api_download():
                 hint = " — YouTube is blocking. Try exporting cookies from your browser."
             elif "Private video" in error_str or "Sign in" in error_str:
                 hint = " — Video is private or requires sign-in."
+        elif plat == "reddit":
+            hint = " — Reddit video format not supported by yt-dlp. Try a different video or check Reddit upload settings."
         elif plat in {"tiktok", "instagram"}:
             hint = " — Platform requires authentication. Export browser cookies."
         

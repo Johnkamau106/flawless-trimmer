@@ -5,6 +5,7 @@ import Player from './components/Player.jsx'
 import QualitySelect from './components/QualitySelect.jsx'
 import RangeSelector from './components/RangeSelector.jsx'
 import { inspectUrl, saveClip } from './api/client.js'
+import { FaYoutube, FaInstagram, FaTiktok, FaTwitter, FaFacebook } from 'react-icons/fa'
 
 function App() {
   const [loading, setLoading] = useState(false)
@@ -29,7 +30,7 @@ function App() {
       setFormats(data.formats)
       setUrl(data.cleanedUrl || u)
       setPlayback(data.playback || data.metadata?.playback || null)
-      setPlay(true)
+      setPlay(false)
       setStatus('')
     } catch (e) {
       setStatus(e?.response?.data?.error || e.message)
@@ -285,7 +286,29 @@ function App() {
         ) : null}
       </main>
 
-      <footer className="footer">Built with React + Flask + yt-dlp</footer>
+      <footer className="footer">
+        <div className="footer-content">
+          <div className="footer-text">Supported Platforms</div>
+          <div className="platform-icons">
+            <a href="#" className="platform-icon" title="YouTube" aria-label="YouTube">
+              <FaYoutube />
+            </a>
+            <a href="#" className="platform-icon" title="Instagram" aria-label="Instagram">
+              <FaInstagram />
+            </a>
+            <a href="#" className="platform-icon" title="TikTok" aria-label="TikTok">
+              <FaTiktok />
+            </a>
+            <a href="#" className="platform-icon" title="Twitter" aria-label="Twitter">
+              <FaTwitter />
+            </a>
+            <a href="#" className="platform-icon" title="Facebook" aria-label="Facebook">
+              <FaFacebook />
+            </a>
+          </div>
+          <div className="footer-credit">Built by @FLAWLESS</div>
+        </div>
+      </footer>
     </div>
   )
 }

@@ -1,55 +1,61 @@
 {
-  "hash": "0b986ed5",
+  "hash": "2c20df84",
   "configHash": "69ea0de8",
-  "lockfileHash": "a6f5a09a",
-  "browserHash": "755d2123",
+  "lockfileHash": "db4c1b52",
+  "browserHash": "ad2e07ab",
   "optimized": {
     "axios": {
       "src": "../../node_modules/axios/index.js",
       "file": "axios.js",
-      "fileHash": "a7fe8751",
+      "fileHash": "d6f62032",
       "needsInterop": false
     },
     "hls.js": {
       "src": "../../node_modules/hls.js/dist/hls.mjs",
       "file": "hls__js.js",
-      "fileHash": "42b6e931",
+      "fileHash": "34280f33",
       "needsInterop": false
     },
     "react-dom": {
       "src": "../../node_modules/react-dom/index.js",
       "file": "react-dom.js",
-      "fileHash": "1342fb43",
+      "fileHash": "29d569c1",
       "needsInterop": true
     },
     "react-dom/client": {
       "src": "../../node_modules/react-dom/client.js",
       "file": "react-dom_client.js",
-      "fileHash": "8d2911ab",
+      "fileHash": "f13861fc",
       "needsInterop": true
+    },
+    "react-icons/fa": {
+      "src": "../../node_modules/react-icons/fa/index.mjs",
+      "file": "react-icons_fa.js",
+      "fileHash": "a6a25ade",
+      "needsInterop": false
     },
     "react-player": {
       "src": "../../node_modules/react-player/dist/index.js",
       "file": "react-player.js",
-      "fileHash": "fc3e84be",
+      "fileHash": "3d2d93b4",
       "needsInterop": false
     },
     "react": {
       "src": "../../node_modules/react/index.js",
       "file": "react.js",
-      "fileHash": "d32f83ca",
+      "fileHash": "e23d5a54",
       "needsInterop": true
     },
     "react/jsx-dev-runtime": {
       "src": "../../node_modules/react/jsx-dev-runtime.js",
       "file": "react_jsx-dev-runtime.js",
-      "fileHash": "0a020d13",
+      "fileHash": "20a77087",
       "needsInterop": true
     },
     "react/jsx-runtime": {
       "src": "../../node_modules/react/jsx-runtime.js",
       "file": "react_jsx-runtime.js",
-      "fileHash": "d0185ae8",
+      "fileHash": "bbe2020b",
       "needsInterop": true
     }
   },

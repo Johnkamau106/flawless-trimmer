@@ -53,6 +53,40 @@ export default function Player({ url, playback, playing, onProgress, onDuration 
         )
     }
 
+    // For webpage embeds (Twitter, TikTok), use ReactPlayer or iframe
+    if (type === 'webpage') {
+        // TikTok embeds need special iframe handling
+        if (playUrl && playUrl.includes('tiktok.com')) {
+            return (
+                <div className="player-wrapper">
+                    <iframe
+                        src={playUrl}
+                        width="100%"
+                        height="100%"
+                        frameBorder="0"
+                        allow="autoplay; encrypted-media"
+                        allowFullScreen
+                        style={{ border: 'none' }}
+                    />
+                </div>
+            )
+        }
+        // Twitter/X and other platforms use ReactPlayer
+        return (
+            <div className="player-wrapper">
+                <ReactPlayer
+                    url={playUrl}
+                    playing={playing}
+                    controls
+                    width="100%"
+                    height="100%"
+                    onProgress={onProgress}
+                    onDuration={onDuration}
+                />
+            </div>
+        )
+    }
+
     // Else fallback to ReactPlayer for providers it supports
     const canPlay = ReactPlayer.canPlay(playUrl)
     if (!canPlay) {

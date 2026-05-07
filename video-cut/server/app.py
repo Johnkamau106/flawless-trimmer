@@ -8,7 +8,7 @@ import requests
 from datetime import datetime, timezone
 from typing import Optional
 from pathlib import Path
-from urllib.parse import urlparse, parse_qsl, urlunparse, urlencode
+from urllib.parse import urlparse, parse_qsl, urlunparse, urlencode, urljoin
 
 from flask import Flask, jsonify, request, send_file, Response, stream_with_context
 from flask_cors import CORS
@@ -64,7 +64,11 @@ def _save_to_cache(cache_key: str, source_path: str, ext: str) -> str:
         return source_path
 
 
-app = Flask(__name__)
+app = Flask(
+    __name__,
+    static_folder=os.path.join(os.path.dirname(__file__), "..", "dist", "assets"),
+    static_url_path="/assets"
+)
 app.config["SQLALCHEMY_DATABASE_URI"] = f"sqlite:///{DB_PATH}"
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 app.config["JSON_SORT_KEYS"] = False
@@ -214,14 +218,17 @@ def _build_ydl_opts(base: Optional[dict] = None, for_url: Optional[str] = None) 
     is_youtube = for_url and detect_platform(for_url) == "youtube"
     platform = detect_platform(for_url) if for_url else "unknown"
     
+    # For Twitter/X, use aggressive concurrency since fragments are the only option
     # For YouTube, use fewer concurrent fragments to avoid rate limiting
-    # For others, use very aggressive concurrency for maximum speed
+    # For others, use reasonable concurrency
     if is_youtube:
         default_concurrent = 2
-    elif platform in {"tiktok", "instagram", "x", "twitter"}:
-        default_concurrent = 32  # VERY aggressive for social media (was 16)
+    elif platform in {"x", "twitter"}:
+        default_concurrent = 16  # Aggressive for Twitter fragments (no rate limit concerns for fragments)
+    elif platform in {"tiktok", "instagram"}:
+        default_concurrent = 8
     else:
-        default_concurrent = 24  # Increased from 12
+        default_concurrent = 6
     concurrent_fragments = int(os.environ.get("VIDSLICER_CONCURRENT_FRAGMENTS", str(default_concurrent)))
     
     opts: dict = {
@@ -229,16 +236,18 @@ def _build_ydl_opts(base: Optional[dict] = None, for_url: Optional[str] = None) 
         "no_warnings": True,
         "noplaylist": True,
         "geo_bypass": True,
-        # Speed up downloads with very aggressive concurrency
+        # Aggressive concurrency for fragments - Twitter uses HLS which is fragment-based
         "concurrent_fragment_downloads": concurrent_fragments,
-        # Increase fragment pool for parallel downloading
-        "fragment_pool_size": 64 if not is_youtube else 8,
-        # Connection optimization for speed - increased timeout for stability
-        "socket_timeout": 60,
-        # Aggressive: minimal retries (0 for non-YouTube)
-        "retries": 0 if not is_youtube else 1,
-        "fragment_retries": 0 if not is_youtube else 1,
-        "file_access_retries": 0,
+        # Large pool for many concurrent fragments
+        "fragment_pool_size": 64,
+        # HTTP connection pool settings for faster downloads
+        "http_chunk_size": 1048576,  # 1MB chunks for HTTP requests
+        # Reasonable timeout
+        "socket_timeout": 45,
+        # Minimal retries - fragments are reliable once stream is obtained
+        "retries": 2,
+        "fragment_retries": 2,
+        "file_access_retries": 1,
         # Reduce connection pool wait time
         "tcp_nodelay": True,
         # Use a realistic desktop UA to reduce blocking
@@ -261,11 +270,15 @@ def _build_ydl_opts(base: Optional[dict] = None, for_url: Optional[str] = None) 
                 "player_client": ["android", "web"],
             }
         }
-    # TikTok/Instagram specific - need browser cookies for better format access
+    # Twitter/X specific options
+    elif platform in {"x", "twitter"}:
+        opts["http_headers"]["Referer"] = "https://twitter.com/"
+        opts["http_headers"]["Origin"] = "https://twitter.com"
+    # TikTok/Instagram specific
     elif platform in {"tiktok", "instagram"}:
         opts["extractor_args"] = {
             platform: {
-                "api_hostname": "api.tiktok.com",  # Use API for faster access
+                "api_hostname": "api.tiktok.com",
             }
         }
     
@@ -273,17 +286,31 @@ def _build_ydl_opts(base: Optional[dict] = None, for_url: Optional[str] = None) 
     if cookiefile and os.path.exists(cookiefile):
         opts["cookiefile"] = cookiefile
     
-    # Use browser cookies automatically if available (prefer env, fallback to chrome)
+    # Use browser cookies automatically if available
     cookies_from_browser = os.environ.get("VIDSLICER_COOKIES_FROM_BROWSER")
     if not cookies_from_browser:
-        # Auto-detect for most Linux/WSL; checks for '~/.config/google-chrome' data directory
-        chrome_cookie_dir = os.path.expanduser("~/.config/google-chrome")
-        if os.path.isdir(chrome_cookie_dir):
-            cookies_from_browser = "chrome"
-        # Also check for Firefox on WSL/Linux
-        firefox_cookie_dir = os.path.expanduser("~/.mozilla/firefox")
-        if not cookies_from_browser and os.path.isdir(firefox_cookie_dir):
-            cookies_from_browser = "firefox"
+        import platform as py_platform
+        is_windows = py_platform.system() == "Windows"
+        
+        if is_windows:
+            chrome_cookie_dir = os.path.expanduser("~\\AppData\\Local\\Google\\Chrome\\User Data")
+            firefox_cookie_dir = os.path.expanduser("~\\.mozilla\\firefox")
+            
+            if os.path.isdir(chrome_cookie_dir):
+                cookies_from_browser = "chrome"
+            elif os.path.isdir(firefox_cookie_dir):
+                cookies_from_browser = "firefox"
+        else:
+            chrome_cookie_dir = os.path.expanduser("~/.config/google-chrome")
+            chromium_cookie_dir = os.path.expanduser("~/.config/chromium")
+            firefox_cookie_dir = os.path.expanduser("~/.mozilla/firefox")
+            
+            if os.path.isdir(chrome_cookie_dir):
+                cookies_from_browser = "chrome"
+            elif os.path.isdir(chromium_cookie_dir):
+                cookies_from_browser = "chromium"
+            elif os.path.isdir(firefox_cookie_dir):
+                cookies_from_browser = "firefox"
     
     if cookies_from_browser:
         opts["cookiesfrombrowser"] = cookies_from_browser
@@ -344,27 +371,38 @@ def list_formats(url: str):
         acodec = f.get("acodec")
         has_video = vcodec != "none" and vcodec is not None
         has_audio = acodec != "none" and acodec is not None
+        url = f.get("url", "")
+        
         if not has_video:
             return None
+        
+        # Ensure URL is absolute (handle relative paths from Twitter/other platforms)
+        if url and url.startswith("/"):
+            if "ext_tw_video" in url or "pbs.twimg" in url:
+                url = f"https://video.twimg.com{url}" if url.startswith("/ext_tw_video") else f"https://pbs.twimg.com{url}"
+            else:
+                # Unknown relative path - skip
+                return None
+        
         # Try progressive MP4 with audio first (YouTube, TikTok, etc.)
         if has_audio and ext == "mp4" and proto in {"https", "http"}:
-            return {"type": "mp4", "url": f.get("url")}
+            return {"type": "mp4", "url": url}
         # HLS streams work well for most platforms (Instagram, TikTok, etc.)
         # HLS is often faster even than MP4 for non-YouTube platforms
         if proto in {"m3u8", "m3u8_native", "hls"}:
-            return {"type": "hls", "url": f.get("url")}
+            return {"type": "hls", "url": url}
         # DASH for high-quality videos
         if proto in {"dash", "http_dash_segments"} or ext == "mpd":
-            return {"type": "dash", "url": f.get("url")}
+            return {"type": "dash", "url": url}
         # Progressive MP4 even without audio (TikTok, X videos often have video-only)
         if ext == "mp4" and proto in {"https", "http"}:
-            return {"type": "mp4", "url": f.get("url")}
+            return {"type": "mp4", "url": url}
         # Fallback: any progressive format with http/https
         if ext in {"mp4", "mkv", "webm"} and proto in {"https", "http"}:
-            return {"type": "mp4", "url": f.get("url")}
+            return {"type": "mp4", "url": url}
         # Last resort: accept video-only formats if nothing else works
         if has_video and proto in {"https", "http"}:
-            return {"type": "mp4", "url": f.get("url")}
+            return {"type": "mp4", "url": url}
         return None
 
     for f in info.get("formats", []):
@@ -400,31 +438,53 @@ def list_formats(url: str):
         if top_url:
             best_playback = {"type": "mp4", "url": top_url}
 
-    # For TikTok/Twitter: prioritize HLS if available (more stable), otherwise add webpage fallback
+    # For TikTok: use embed format if available
+    # For Twitter/X: use direct video URLs (yt-dlp extracts working ones)
     platform = detect_platform(url)
     webpage_url = info.get("webpage_url") or url
     
-    if platform in {"tiktok", "x", "twitter"}:
-        # HLS streams are more reliable for these platforms
-        hls_playback = next(({"type": "hls", "url": f.get("url")} 
-                           for f in info.get("formats", []) 
-                           if (f.get("protocol") or "").lower() in {"m3u8", "m3u8_native", "hls"}), 
-                          None)
-        if hls_playback:
-            best_playback = hls_playback
+    # Twitter/X: use the extracted video URL directly (yt-dlp finds working URLs)
+    # This avoids the broken Twitter embed widget and plays the video directly
+    if platform in {"x", "twitter"}:
+        # If we found a working video format, use it directly
+        # yt-dlp extracts HLS or MP4 URLs that bypass the widget requirement
+        if not best_playback:
+            best_playback = {"type": "webpage", "url": webpage_url}
+        # else: use the best_playback found from format selection
+    elif platform == "tiktok":
+        # TikTok: prefer embed format, fallback to webpage
+        video_id = info.get("id")
+        if video_id:
+            # TikTok embed URL format
+            embed_url = f"https://www.tiktok.com/embed/v2/{video_id}"
+            best_playback = {"type": "webpage", "url": embed_url}
         elif not best_playback:
-            # For TikTok, create embed URL; for Twitter use webpage URL
-            if platform == "tiktok":
-                video_id = info.get("id")
-                if video_id:
-                    # TikTok embed URL format
-                    embed_url = f"https://www.tiktok.com/embed/v2/{video_id}"
-                    best_playback = {"type": "webpage", "url": embed_url}
-                else:
-                    best_playback = {"type": "webpage", "url": webpage_url}
-            else:
-                # Twitter/X can use webpage URL directly
-                best_playback = {"type": "webpage", "url": webpage_url}
+            best_playback = {"type": "webpage", "url": webpage_url}
+
+    # Wrap video URLs with proxy endpoint for platforms that block direct access
+    # (Twitter, Instagram, etc.)
+    if best_playback and best_playback.get("type") in {"hls", "mp4", "dash"}:
+        video_url = best_playback.get("url", "")
+        # Check if URL needs proxying (Twitter, Instagram, etc.) or is malformed (missing domain)
+        needs_proxy = False
+        
+        # Check if it's a known CDN that needs proxying
+        if any(host in video_url.lower() for host in ["twimg.com", "pbs.twimg.com", "video.twimg.com", "instagram.com", "scontent-", "fbcdn.net"]):
+            needs_proxy = True
+        # Check if URL is missing scheme/domain (e.g., starts with /ext_tw_video)
+        elif video_url.startswith("/") and not video_url.startswith("//"):
+            # Relative path - likely a Twitter video URL missing the domain
+            # Reconstruct it as a full Twitter URL
+            if "ext_tw_video" in video_url:
+                video_url = f"https://video.twimg.com{video_url}"
+                needs_proxy = True
+        
+        if needs_proxy:
+            import base64
+            url_encoded = base64.b64encode(video_url.encode()).decode("utf-8")
+            proxy_url = f"/api/stream?url={url_encoded}&type={best_playback.get('type')}"
+            best_playback = best_playback.copy()
+            best_playback["url"] = proxy_url
 
     meta = {
         "id": info.get("id"),
@@ -436,6 +496,7 @@ def list_formats(url: str):
         "platform": detect_platform(url),
         "playback": best_playback,
     }
+    
     return meta, formats
 
 
@@ -476,8 +537,8 @@ def download_media(url: str, format_id: Optional[str], audio_only: bool, start: 
         ydl_opts["format"] = preferred_format
 
     # Retry download on failure with fallback handling
-    # Reduced retries for faster downloads on non-YouTube platforms
-    max_retries = 1 if detect_platform(url) != "youtube" else 2
+    # More retries for Twitter/X to handle network issues
+    max_retries = 3 if detect_platform(url) in {"x", "twitter"} else 1
     last_error = None
     downloaded = None
     info = None
@@ -488,26 +549,24 @@ def download_media(url: str, format_id: Optional[str], audio_only: bool, start: 
         platform = detect_platform(url)
         if platform == "youtube":
             fallback_formats = [
-                "best[ext=mp4]/best",         # Fast: single-stream mp4
-                "bestvideo+bestaudio/best",  # Merge if needed
-                "best",                       # Fallback
-            ]
-        elif platform in {"tiktok", "instagram", "facebook"}:
-            # These platforms: prioritize playable MP4 formats for speed
-            # For TikTok: explicitly avoid formats with format_id that may contain ads/problematic codecs
-            fallback_formats = [
-                "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]",  # Merge video+audio for TikTok (better quality)
-                "best[ext=mp4]",              # FASTEST: best MP4 available (no merge)
-                "best[height>=480]/best",    # Good quality MP4
-                "best[height>=360]/best",    # Lower quality but plays
-                "best",                       # Whatever is available
+                "best[ext=mp4]/best",
+                "bestvideo+bestaudio/best",
+                "best",
             ]
         elif platform in {"x", "twitter"}:
-            # Twitter/X: similar to TikTok, prefer MP4
+            # Twitter/X: Use best available - typically HLS fragments
+            # Don't try to avoid fragments - they're the only option, but we can optimize download
             fallback_formats = [
-                "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]",  # Merge for better compatibility
-                "best[ext=mp4]",              # Best MP4 format
+                "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]",  # Prefer merged video+audio
+                "bestvideo+bestaudio/best",  # Let ffmpeg merge any format
+                "best",                       # Fallback to whatever works
+            ]
+        elif platform in {"tiktok", "instagram", "facebook"}:
+            fallback_formats = [
+                "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]",
+                "best[ext=mp4]",
                 "best[height>=480]/best",
+                "best[height>=360]/best",
                 "best",
             ]
         else:
@@ -556,12 +615,20 @@ def download_media(url: str, format_id: Optional[str], audio_only: bool, start: 
             if "Private video" in error_str or "Sign in" in error_str or "not available" in error_str.lower():
                 raise
 
-            # Retry on rate-limit errors only (skip for most platforms to speed up)
-            if attempt < max_retries and ("403" in error_str or "Forbidden" in error_str or "rate limit" in error_str.lower()):
-                if detect_platform(url) == "youtube":
-                    time.sleep((attempt + 1) * 0.5)
-                    continue
-                # For other platforms, don't retry on 403 - it's often permanent
+            # Retry on network/rate-limit errors with exponential backoff
+            if attempt < max_retries:
+                is_network_error = "Network is unreachable" in error_str or "timeout" in error_str.lower() or "timed out" in error_str.lower()
+                is_rate_limit = "403" in error_str or "Forbidden" in error_str or "rate limit" in error_str.lower()
+                
+                if is_network_error or is_rate_limit:
+                    # For Twitter, use exponential backoff: 2s, 4s, 8s
+                    if detect_platform(url) in {"x", "twitter"}:
+                        wait_time = 2 ** (attempt + 1)
+                        time.sleep(wait_time)
+                        continue
+                    elif detect_platform(url) == "youtube" and is_rate_limit:
+                        time.sleep((attempt + 1) * 0.5)
+                        continue
 
             # Otherwise bubble up the error
             raise
@@ -597,6 +664,11 @@ def download_media(url: str, format_id: Optional[str], audio_only: bool, start: 
         proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         if proc.returncode != 0:
             # Re-encode on failure - use audio-only codec for audio, video+audio for video
+            # Use ultrafast preset for Twitter/X to speed up encoding
+            is_twitter = detect_platform(url) in {"x", "twitter"}
+            preset = "ultrafast" if is_twitter else "veryfast"
+            crf = "28" if is_twitter else "23"  # Lower quality for speed on Twitter
+            
             if audio_only:
                 # Audio-only: encode to mp3 with libmp3lame
                 cmd = [
@@ -630,9 +702,9 @@ def download_media(url: str, format_id: Optional[str], audio_only: bool, start: 
                     "-c:v",
                     "libx264",
                     "-preset",
-                    "veryfast",
+                    preset,
                     "-crf",
-                    "23",
+                    crf,
                     "-c:a",
                     "aac",
                     "-b:a",
@@ -665,6 +737,10 @@ def download_media(url: str, format_id: Optional[str], audio_only: bool, start: 
                 final_path = output_path
             except Exception:
                 # If copy fails, re-encode - use audio-only codec for audio, video+audio for video
+                is_twitter = detect_platform(url) in {"x", "twitter"}
+                preset = "ultrafast" if is_twitter else "veryfast"
+                crf = "28" if is_twitter else "23"
+                
                 if audio_only:
                     # Audio-only: encode to mp3 with libmp3lame
                     cmd = [
@@ -690,9 +766,9 @@ def download_media(url: str, format_id: Optional[str], audio_only: bool, start: 
                         "-c:v",
                         "libx264",
                         "-preset",
-                        "veryfast",
+                        preset,
                         "-crf",
-                        "23",
+                        crf,
                         "-c:a",
                         "aac",
                         "-b:a",
@@ -741,7 +817,13 @@ def api_inspect():
     url = clean_youtube_params(url)
     try:
         meta, formats = list_formats(url)
-        return jsonify({"metadata": meta, "formats": formats, "cleanedUrl": url, "playback": meta.get("playback")})
+        playback = meta.get("playback")
+        # Log playback URL for Twitter debugging
+        if detect_platform(url) in {"x", "twitter"}:
+            print(f"[Twitter Playback] URL: {url}")
+            print(f"[Twitter Playback] Type: {playback.get('type') if playback else 'None'}")
+            print(f"[Twitter Playback] Video URL: {playback.get('url') if playback else 'None'}")
+        return jsonify({"metadata": meta, "formats": formats, "cleanedUrl": url, "playback": playback})
     except Exception as exc:
         # Provide clearer message for common blocked cases
         error_str = str(exc)
@@ -750,21 +832,171 @@ def api_inspect():
         
         if plat == "youtube":
             if "signature" in error_str.lower() or "nsig" in error_str.lower() or "Precondition check failed" in error_str.lower():
-                hint = " — YouTube signature extraction failed. Solution: Use Python 3.9+ or export browser cookies."
+                hint = " — YouTube signature extraction failed. Solution: Export cookies from your browser using: VIDSLICER_COOKIES_FROM_BROWSER=chrome (or firefox). See YOUTUBE_COOKIES_GUIDE.md"
+            elif "Sign in" in error_str or "bot" in error_str.lower():
+                hint = " — YouTube is blocking this video, likely due to bot detection or age restriction. SOLUTION: Export your browser cookies! Steps: 1) Install the 'Open in Browser' extension, 2) Export cookies with VIDSLICER_COOKIES_FROM_BROWSER=chrome (Windows) or chrome/firefox (Linux), 3) Restart the app. See YOUTUBE_COOKIES_GUIDE.md"
             elif "403" in error_str or "Forbidden" in error_str or "HTTP Error 403" in error_str:
-                hint = " — YouTube is blocking access. Try: 1) Export cookies from your browser, 2) Update yt-dlp, 3) Try again after a few minutes."
-            elif "Private video" in error_str or "Sign in" in error_str:
-                hint = " — Video may be private or require sign-in."
+                hint = " — YouTube is blocking access (403 Forbidden). Try: 1) Export cookies from your browser (VIDSLICER_COOKIES_FROM_BROWSER=chrome), 2) Update yt-dlp, 3) Try again after a few minutes."
+            elif "Private video" in error_str:
+                hint = " — This video is private and cannot be downloaded."
             elif "not available" in error_str.lower():
-                hint = " — Video format not available (geo-blocked or age-restricted)."
+                hint = " — Video format not available (geo-blocked, age-restricted, or removed)."
         elif plat == "tiktok":
-            hint = " — TikTok requires authentication. Either: 1) Export cookies from TikTok in your browser (VIDSLICER_COOKIES_FROM_BROWSER='firefox'), 2) Some TikTok videos may not be downloadable due to platform restrictions."
+            hint = " — TikTok requires authentication. Solution: 1) Export cookies from TikTok in your browser (VIDSLICER_COOKIES_FROM_BROWSER=firefox), 2) Some TikTok videos may not be downloadable due to platform restrictions."
         elif plat == "instagram":
-            hint = " — Instagram requires authentication. Export cookies from Instagram (VIDSLICER_COOKIES_FROM_BROWSER='firefox') for access."
-        elif plat in {"x", "twitter", "facebook"}:
-            hint = " — Platform may require authentication. Export browser cookies for better access."
+            hint = " — Instagram requires authentication. Solution: Export cookies from Instagram using VIDSLICER_COOKIES_FROM_BROWSER=firefox"
+        elif plat in {"x", "twitter"}:
+            if "Network is unreachable" in error_str or "401" in error_str or "403" in error_str or "Forbidden" in error_str:
+                hint = " — Twitter/X is blocking access. Solution: Export cookies from Twitter using VIDSLICER_COOKIES_FROM_BROWSER=chrome or firefox. See YOUTUBE_COOKIES_GUIDE.md for instructions."
+            else:
+                hint = " — Platform may require authentication. Export browser cookies (VIDSLICER_COOKIES_FROM_BROWSER=chrome or firefox) for better access."
+        else:
+            hint = " — Platform may require authentication. Export browser cookies (VIDSLICER_COOKIES_FROM_BROWSER=chrome or firefox) for better access."
         
         return jsonify({"error": f"{error_str}{hint}"}), 400
+
+
+@app.route("/api/stream", methods=["GET"])
+def api_stream():
+    """
+    Proxy endpoint for streaming video content from external sources.
+    Handles Twitter/X HLS streams, YouTube, etc. with proper headers.
+    Rewrites HLS playlists to use absolute URLs for segment requests.
+    Required params: url (base64-encoded), type (hls/mp4/dash)
+    """
+    import base64
+    import re
+    
+    url_b64 = request.args.get("url", "")
+    stream_type = request.args.get("type", "hls")
+    
+    if not url_b64:
+        return jsonify({"error": "Missing url parameter"}), 400
+    
+    try:
+        stream_url = base64.b64decode(url_b64).decode("utf-8")
+    except Exception as e:
+        return jsonify({"error": f"Invalid URL encoding: {e}"}), 400
+    
+    # Validate that URL is from allowed streaming sources
+    allowed_hosts = {
+        "video.twimg.com",  # Twitter
+        "pbs.twimg.com",    # Twitter media
+        "r.twimg.com",      # Twitter
+        "manifest.googlevideo.com",  # YouTube
+        "rr.prod.svcs.gstatic.com",  # YouTube
+        "cdn-fqdn.fyp.tiktok.com",   # TikTok
+        "instagram.com",    # Instagram
+        "scontent-",        # Instagram CDN
+        "v",                # Generic video CDN
+        "cdn",              # Generic CDN
+    }
+    
+    parsed = urlparse(stream_url)
+    hostname = parsed.netloc.lower()
+    
+    # Check if hostname is allowed
+    if not any(allowed in hostname for allowed in allowed_hosts):
+        return jsonify({"error": "URL not from allowed streaming source"}), 403
+    
+    try:
+        # Fetch video stream with proper headers for Twitter/X
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Referer": "https://twitter.com/",
+            "Origin": "https://twitter.com",
+            "Accept": "*/*",
+        }
+        
+        response = requests.get(
+            stream_url,
+            headers=headers,
+            timeout=30,
+            stream=True,
+            verify=True
+        )
+        
+        if response.status_code == 403:
+            # Try without Referer if Twitter blocks it
+            headers.pop("Referer", None)
+            response = requests.get(
+                stream_url,
+                headers=headers,
+                timeout=30,
+                stream=True,
+                verify=True
+            )
+        
+        if response.status_code != 200:
+            return jsonify({"error": f"Failed to fetch stream: {response.status_code}"}), response.status_code
+        
+        # For HLS playlists, rewrite relative URLs to absolute ones
+        if stream_type == "hls" and "m3u8" in stream_url.lower():
+            # Read entire playlist content
+            playlist_content = response.text
+            
+            # Get the base URL for resolving relative paths
+            base_url = stream_url.rsplit('/', 1)[0] + '/'
+            
+            # Rewrite relative URLs to absolute URLs
+            # Pattern: lines that don't start with # or http (these are segment URLs)
+            lines = playlist_content.split('\n')
+            rewritten_lines = []
+            
+            for line in lines:
+                line = line.rstrip()
+                # If it's a relative URL (doesn't start with # and doesn't start with http)
+                if line and not line.startswith('#') and not line.startswith('http'):
+                    # Make it absolute
+                    absolute_url = urljoin(base_url, line)
+                    rewritten_lines.append(absolute_url)
+                else:
+                    # Keep comments and other content as-is
+                    rewritten_lines.append(line)
+            
+            rewritten_content = '\n'.join(rewritten_lines)
+            
+            return Response(
+                rewritten_content,
+                mimetype="application/vnd.apple.mpegurl",
+                headers={
+                    "Cache-Control": "public, max-age=3600",
+                    "Connection": "keep-alive",
+                }
+            )
+        
+        # For non-HLS or if we can't modify, stream as-is
+        content_type = response.headers.get("content-type", "application/octet-stream")
+        if stream_type == "hls":
+            content_type = "application/vnd.apple.mpegurl"
+        elif stream_type == "mp4":
+            content_type = "video/mp4"
+        elif stream_type == "dash":
+            content_type = "application/dash+xml"
+        
+        def stream_generator():
+            """Stream video in chunks"""
+            chunk_size = 65536  # 64KB chunks
+            for chunk in response.iter_content(chunk_size=chunk_size):
+                if chunk:
+                    yield chunk
+        
+        return Response(
+            stream_generator(),
+            mimetype=content_type,
+            headers={
+                "Accept-Ranges": "bytes",
+                "Cache-Control": "public, max-age=3600",
+                "Connection": "keep-alive",
+            }
+        )
+    
+    except requests.exceptions.Timeout:
+        return jsonify({"error": "Stream request timed out"}), 504
+    except requests.exceptions.RequestException as e:
+        return jsonify({"error": f"Failed to fetch stream: {str(e)}"}), 502
+    except Exception as e:
+        return jsonify({"error": f"Stream proxy error: {str(e)}"}), 500
 
 
 @app.route("/api/get-download-url", methods=["POST"])
@@ -841,11 +1073,13 @@ def api_get_download_url():
         
         if plat == "youtube":
             if "signature" in error_str.lower() or "nsig" in error_str.lower():
-                hint = " — YouTube signature extraction failed. Try exporting cookies from your browser."
+                hint = " — YouTube signature extraction failed. Export browser cookies using VIDSLICER_COOKIES_FROM_BROWSER=chrome"
+            elif "Sign in" in error_str or "bot" in error_str.lower():
+                hint = " — YouTube is blocking bot-like access. Export your browser cookies! Set VIDSLICER_COOKIES_FROM_BROWSER=chrome (Windows) or chrome/firefox (Linux)"
             elif "403" in error_str or "Forbidden" in error_str:
-                hint = " — YouTube is blocking access. Try exporting cookies or retry later."
+                hint = " — YouTube is blocking access (403 Forbidden). Export browser cookies or try again later."
         elif plat in {"tiktok", "instagram"}:
-            hint = " — Platform requires authentication. Export browser cookies for access."
+            hint = " — Platform requires authentication. Export browser cookies (VIDSLICER_COOKIES_FROM_BROWSER=chrome or firefox) for access."
         
         return jsonify({"error": f"{error_str}{hint}"}), 400
 
@@ -930,6 +1164,11 @@ def api_download():
                 hint = " — YouTube is blocking. Try exporting cookies from your browser."
             elif "Private video" in error_str or "Sign in" in error_str:
                 hint = " — Video is private or requires sign-in."
+        elif plat in {"x", "twitter"}:
+            if "Network is unreachable" in error_str or "401" in error_str or "403" in error_str:
+                hint = " — Twitter/X is blocking access. Try exporting cookies from your browser (VIDSLICER_COOKIES_FROM_BROWSER=chrome or firefox), or try again in a few minutes."
+            elif "timeout" in error_str.lower() or "timed out" in error_str.lower():
+                hint = " — Download timed out. This can happen with slow network connections. Try again or export browser cookies for better access."
         elif plat == "reddit":
             hint = " — Reddit video format not supported by yt-dlp. Try a different video or check Reddit upload settings."
         elif plat in {"tiktok", "instagram"}:
@@ -972,7 +1211,7 @@ def api_clip_save():
         
         # Read file and send it
         def generate():
-            chunk_size = 8192
+            chunk_size = 65536  # 64KB chunks for faster streaming
             try:
                 with open(final_path, 'rb') as f:
                     while True:
@@ -1000,6 +1239,8 @@ def api_clip_save():
                 "Content-Disposition": cd_header,
                 "Cache-Control": "no-cache, no-store, must-revalidate",
                 "Connection": "keep-alive",
+                "Transfer-Encoding": "chunked",
+                "X-Accel-Buffering": "no",  # Disable nginx buffering for streaming
             }
         )
         response.timeout = None
@@ -1015,6 +1256,11 @@ def api_clip_save():
                 hint = " — YouTube is blocking the download. Try exporting cookies from your browser."
             elif "Private video" in error_str or "Sign in" in error_str:
                 hint = " — Video is private or requires sign-in."
+        elif plat in {"x", "twitter"}:
+            if "Network is unreachable" in error_str or "401" in error_str or "403" in error_str:
+                hint = " — Twitter/X is blocking access. Try exporting cookies from your browser (VIDSLICER_COOKIES_FROM_BROWSER=chrome or firefox), or try again later."
+            elif "timeout" in error_str.lower() or "timed out" in error_str.lower():
+                hint = " — Download timed out. Try again or export browser cookies for better access."
         elif plat in {"tiktok", "instagram"}:
             hint = " — Platform requires authentication. Export cookies from your browser."
         
@@ -1033,6 +1279,34 @@ def api_thumbnail(clip_id: int):
     if not clip.thumbnail_path or not os.path.exists(clip.thumbnail_path):
         return jsonify({"error": "No thumbnail"}), 404
     return send_file(clip.thumbnail_path)
+
+
+# ========== FRONTEND SERVING ==========
+# Serve static files (JS, CSS, etc.) from dist/assets
+# This is handled automatically by Flask's static_folder configuration
+
+# Serve index.html for root path
+@app.route("/")
+def serve_index():
+    dist_path = os.path.join(os.path.dirname(__file__), "..", "dist", "index.html")
+    if os.path.exists(dist_path):
+        return send_file(dist_path)
+    return jsonify({"error": "Frontend not built. Run 'npm run build' in the project root."}), 500
+
+
+# Catch-all route: serve index.html for React Router client-side routing
+# This must be last so it doesn't interfere with API routes
+@app.route("/<path:path>")
+def serve_frontend(path):
+    # If the path is an API route, let Flask handle it normally (will 404)
+    if path.startswith("api/"):
+        return jsonify({"error": f"API endpoint not found: /{path}"}), 404
+    
+    # Otherwise serve index.html so React Router can handle the path
+    dist_path = os.path.join(os.path.dirname(__file__), "..", "dist", "index.html")
+    if os.path.exists(dist_path):
+        return send_file(dist_path)
+    return jsonify({"error": "Frontend not built. Run 'npm run build' in the project root."}), 500
 
 
 if __name__ == "__main__":

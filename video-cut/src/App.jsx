@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react'
+import { useMemo, useState, useEffect } from 'react'
 import './App.css'
 import UrlInput from './components/UrlInput.jsx'
 import Player from './components/Player.jsx'
@@ -31,6 +31,12 @@ function App() {
       setUrl(data.cleanedUrl || u)
       setPlayback(data.playback || data.metadata?.playback || null)
       setPlay(false)
+      // Reset all state for the new video
+      setDuration(0)
+      setRange({ start: 0, end: 0 })
+      setQuality('')
+      setIsTrimmed(false)
+      setIsDownloaded(false)
       setStatus('')
     } catch (e) {
       setStatus(e?.response?.data?.error || e.message)
@@ -43,6 +49,14 @@ function App() {
     setDuration(d)
     setRange(r => ({ start: 0, end: d }))
   }
+
+  // Use metadata duration as fallback (for platforms like Twitter where player can't report duration)
+  useEffect(() => {
+    if (meta?.duration && duration === 0) {
+      setDuration(meta.duration)
+      setRange({ start: 0, end: meta.duration })
+    }
+  }, [meta?.duration, duration])
 
   const isAudio = quality === 'audio:mp3'
 
